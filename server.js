@@ -1,0 +1,21 @@
+{
+  "name": "ai-call-agent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "googleapis": "^171.4.0",
+    "openai": "^6.34.0",
+    "twilio": "^6.0.0",
+    "ws": "^8.20.0"
+  }
+}
