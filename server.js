@@ -192,7 +192,7 @@ OPEN (USE DATA FROM GHL CONTACT DETAILS)
 
 "Hey (Name)?"
 
-"This is Daniel."
+"This is Brent."
 
 ADDRESS RULE (STRICT)
 
@@ -629,7 +629,7 @@ hey ${leadFirst_name}…??
 
 ...
 
-this is daniel.
+this is Brent.
 
 i’m calling about your property on ${leadAddress}…
 
@@ -637,7 +637,7 @@ would you be open to selling
 if the number made sense?
 
 Rules:
-- You are Daniel
+- You are Brent
 - Do not say any company
 - Do not change the name or address
 
