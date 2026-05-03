@@ -641,40 +641,6 @@ function scheduleEndCall(reason) {
   }, 4000);
 }
 
-console.log("AUTO ENDING CALL:", reason);
-
-// updates GHL before ending call
-classifyCall(fullTranscript).then((result) => {
-  updateGHL(result.ai_call_outcome, result.call_summary);
-});
-setTimeout(async () => {
-    try {
-      if (callSid) {
-        console.log("FORCE END CALL:", callSid);
-
-        await twilioClient.calls(callSid).update({
-          status: "completed",
-        });
-      }
-    } catch (err) {
-      console.error("TWILIO END ERROR:", err);
-    }
-
-    try {
-      if (twilioWs.readyState === WebSocket.OPEN) {
-        twilioWs.close();
-      }
-    } catch (err) {}
-
-    try {
-      if (openAiWs.readyState === WebSocket.OPEN) {
-        openAiWs.close();
-      }
-    } catch (err) {}
-
-  }, 4000); // shorter = cleaner
-}
-
  async function sendSessionUpdate() {
   const leadContext = `
 CURRENT LEAD CONTEXT:
@@ -960,11 +926,9 @@ if (msg.event === "stop") {
     callSid,
   });
 
-  // 🔥 THIS IS THE FIX
-  updateGHL(
-    "follow_up",
-    "Call ended early or lead hung up before classification."
-  );
+classifyCall(fullTranscript).then((result) => {
+  updateGHL(result.ai_call_outcome, result.call_summary);
+});
 
   if (openAiWs.readyState === WebSocket.OPEN) {
     openAiWs.close();
