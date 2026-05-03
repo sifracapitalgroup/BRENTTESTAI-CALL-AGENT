@@ -531,15 +531,122 @@ async function updateGHL(outcome, summary) {
   }
 }
 
+async function classifyCall(transcript) {
+  try {
+    if (!transcript || transcript.trim().length < 20) {
+      return {
+        ai_call_outcome: "no_answer_voicemail",
+        call_summary: "Call ended with little or no meaningful conversation.",
+      };
+    }
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4.1-mini",
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: `
+You classify real estate seller calls.
+
+Return ONLY valid JSON with:
+{
+  "ai_call_outcome": "no_answer_voicemail | follow_up | interested | not_interested",
+  "call_summary": "short summary"
+}
+
+Rules:
+- no_answer_voicemail = no meaningful conversation, voicemail, no answer, immediate hangup
+- follow_up = unsure, maybe later, needs time, not enough info, unclear
+- interested = open to selling, gives price/timeline/condition, wants offer, wants next step
+- not_interested = clearly says no, stop calling, already sold, not selling
+
+If uncertain, choose follow_up.
+`,
+          },
+          {
+            role: "user",
+            content: transcript,
+          },
+        ],
+      }),
+    });
+
+    const data = await response.json();
+    const parsed = JSON.parse(data.choices[0].message.content);
+
+    const allowed = [
+      "no_answer_voicemail",
+      "follow_up",
+      "interested",
+      "not_interested",
+    ];
+
+    if (!allowed.includes(parsed.ai_call_outcome)) {
+      parsed.ai_call_outcome = "follow_up";
+    }
+
+    return parsed;
+  } catch (err) {
+    console.error("CLASSIFY CALL ERROR:", err);
+
+    return {
+      ai_call_outcome: "follow_up",
+      call_summary: "Call ended, but classification failed.",
+    };
+  }
+}
+
 function scheduleEndCall(reason) {
   if (callEndingScheduled) return;
   callEndingScheduled = true;
 
+  console.log("AUTO ENDING CALL:", reason);
+
+  classifyCall(fullTranscript).then((result) => {
+    updateGHL(result.ai_call_outcome, result.call_summary);
+  });
+
+  setTimeout(async () => {
+    try {
+      if (callSid) {
+        console.log("FORCE END CALL:", callSid);
+
+        await twilioClient.calls(callSid).update({
+          status: "completed",
+        });
+      }
+    } catch (err) {
+      console.error("TWILIO END ERROR:", err);
+    }
+
+    try {
+      if (twilioWs.readyState === WebSocket.OPEN) {
+        twilioWs.close();
+      }
+    } catch (err) {}
+
+    try {
+      if (openAiWs.readyState === WebSocket.OPEN) {
+        openAiWs.close();
+      }
+    } catch (err) {}
+
+  }, 4000);
+}
+
 console.log("AUTO ENDING CALL:", reason);
 
 // updates GHL before ending call
-updateGHL("follow_up", reason);
-
+classifyCall(fullTranscript).then((result) => {
+  updateGHL(result.ai_call_outcome, result.call_summary);
+});
 setTimeout(async () => {
     try {
       if (callSid) {
@@ -605,8 +712,11 @@ Use the data only to guide better questions.
         prefix_padding_ms: 300,
         silence_duration_ms: 750,
       },
-      input_audio_format: "g711_ulaw",
-      instructions: SYSTEM_PROMPT + "\n\n" + leadContext,
+input_audio_format: "g711_ulaw",
+input_audio_transcription: {
+  model: "whisper-1",
+},
+instructions: SYSTEM_PROMPT + "\n\n" + leadContext,
       modalities: ["text"],
       temperature: 0.65,
     },
@@ -748,23 +858,30 @@ async function speakWithElevenLabs(text) {
 }
 // ✅ THEN this
 let assistantText = "";
-
+let fullTranscript = "";
+  
 // ✅ THEN your OpenAI handler
-
 
 openAiWs.on("message", (data) => {
   try {
     const event = JSON.parse(data.toString());
     console.log("OPENAI EVENT:", event.type);
 
-  // collect streaming text
-if (event.type === "response.text.delta" && event.delta) {
-  assistantText += event.delta;
-}
+    // capture seller speech
+    if (event.type === "conversation.item.input_audio_transcription.completed") {
+      fullTranscript += `\nSeller: ${event.transcript}`;
+      console.log("SELLER SAID:", event.transcript);
+    }
+
+    // collect AI streaming text
+    if (event.type === "response.text.delta" && event.delta) {
+      assistantText += event.delta;
+    }
 
 // full message finished
 if (event.type === "response.text.done") {
   console.log("AI SAID:", assistantText);
+  fullTranscript += `\nAI: ${assistantText}`;
 
   speakWithElevenLabs(assistantText);
 
