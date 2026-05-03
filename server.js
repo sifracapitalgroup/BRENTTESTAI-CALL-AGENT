@@ -837,16 +837,22 @@ if (shouldEndCall(assistantText)) {
         return;
       }
 
-      if (msg.event === "stop") {
-        console.log("Twilio stream stopped:", {
-          streamSid,
-          callSid,
-        });
+if (msg.event === "stop") {
+  console.log("Twilio stream stopped:", {
+    streamSid,
+    callSid,
+  });
 
-        if (openAiWs.readyState === WebSocket.OPEN) {
-          openAiWs.close();
-        }
-      }
+  // 🔥 THIS IS THE FIX
+  updateGHL(
+    "follow_up",
+    "Call ended early or lead hung up before classification."
+  );
+
+  if (openAiWs.readyState === WebSocket.OPEN) {
+    openAiWs.close();
+  }
+}
     } catch (err) {
       console.error("Twilio message error:", err);
     }
