@@ -499,14 +499,48 @@ if (currentCallLead.city || currentCallLead.state) {
 
   return hardGoodbye || clearClose;
 }
+async function updateGHL(outcome, summary) {
+  try {
+    const response = await fetch("https://services.leadconnectorhq.com/contacts/upsert", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.GHL_API_KEY}`,
+        Version: "2021-07-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        locationId: process.env.GHL_LOCATION_ID,
+        phone: currentCallLead.phone,
+        customFields: [
+          {
+            key: "ai_call_outcome",
+            field_value: outcome,
+          },
+          {
+            key: "call_notes",
+            field_value: summary,
+          },
+        ],
+      }),
+    });
+
+    const data = await response.json();
+    console.log("GHL UPDATED:", data);
+  } catch (err) {
+    console.error("GHL UPDATE ERROR:", err);
+  }
+}
 
 function scheduleEndCall(reason) {
   if (callEndingScheduled) return;
   callEndingScheduled = true;
 
-  console.log("AUTO ENDING CALL:", reason);
+console.log("AUTO ENDING CALL:", reason);
 
-  setTimeout(async () => {
+// updates GHL before ending call
+updateGHL("follow_up", reason);
+
+setTimeout(async () => {
     try {
       if (callSid) {
         console.log("FORCE END CALL:", callSid);
