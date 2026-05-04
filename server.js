@@ -362,6 +362,30 @@ app.all("/voice", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
+app.post("/call-status", async (req, res) => {
+  try {
+    console.log("CALL STATUS:", req.body);
+
+    const callStatus = req.body.CallStatus;
+
+    if (
+      callStatus === "no-answer" ||
+      callStatus === "busy" ||
+      callStatus === "failed"
+    ) {
+      await updateGHL(
+        "no_answer_voicemail",
+        `Call ended with status: ${callStatus}. No meaningful conversation.`
+      );
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("CALL STATUS ERROR:", err);
+    res.sendStatus(500);
+  }
+});
+
 app.post("/start-call", async (req, res) => {
   try {
     const {
@@ -426,11 +450,13 @@ app.post("/start-call", async (req, res) => {
       process.env.PUBLIC_BASE_URL?.replace(/\/$/, "") ||
       `https://${req.headers.host}`;
 
-    const call = await twilioClient.calls.create({
-      to: cleanPhone,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      url: `${publicBaseUrl}/voice`,
-    });
+const call = await twilioClient.calls.create({
+  to: cleanPhone,
+  from: process.env.TWILIO_PHONE_NUMBER,
+  url: `${publicBaseUrl}/voice`,
+  statusCallback: `${publicBaseUrl}/call-status`,
+  statusCallbackEvent: ["completed", "no-answer", "busy", "failed"],
+});
 
     console.log("OUTBOUND CALL STARTED:", call.sid);
 
