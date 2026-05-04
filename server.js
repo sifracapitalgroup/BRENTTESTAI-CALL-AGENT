@@ -362,6 +362,38 @@ app.all("/voice", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
+async function updateGHL(outcome, summary, phoneOverride) {
+  try {
+    const response = await fetch("https://services.leadconnectorhq.com/contacts/upsert", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.GHL_API_KEY}`,
+        Version: "2021-07-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        locationId: process.env.GHL_LOCATION_ID,
+        phone: phoneOverride,
+        customFields: [
+          {
+            key: "ai_call_outcome",
+            field_value: outcome,
+          },
+          {
+            key: "call_notes",
+            field_value: summary,
+          },
+        ],
+      }),
+    });
+
+    const data = await response.json();
+    console.log("GHL UPDATED:", data);
+  } catch (err) {
+    console.error("GHL UPDATE ERROR:", err);
+  }
+}
+
 app.post("/call-status", async (req, res) => {
   try {
     console.log("CALL STATUS:", req.body);
@@ -532,37 +564,6 @@ if (currentCallLead.city || currentCallLead.state) {
     t.includes("i’ll circle back with you");
 
   return hardGoodbye || clearClose;
-}
-async function updateGHL(outcome, summary, phoneOverride) {
-  try {
-    const response = await fetch("https://services.leadconnectorhq.com/contacts/upsert", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.GHL_API_KEY}`,
-        Version: "2021-07-28",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        locationId: process.env.GHL_LOCATION_ID,
-        phone: phoneOverride,
-        customFields: [
-          {
-            key: "ai_call_outcome",
-            field_value: outcome,
-          },
-          {
-            key: "call_notes",
-            field_value: summary,
-          },
-        ],
-      }),
-    });
-
-    const data = await response.json();
-    console.log("GHL UPDATED:", data);
-  } catch (err) {
-    console.error("GHL UPDATE ERROR:", err);
-  }
 }
 
 async function classifyCall(transcript) {
@@ -994,15 +995,17 @@ if (msg.event === "stop") {
   });
 
 if (!sellerSpoke) {
-  updateGHL(
-    "no_answer_voicemail",
-    "No answer or voicemail reached. No meaningful seller response."
-  );
+updateGHL(
+  "no_answer_voicemail",
+  "No answer or voicemail reached. No meaningful seller response.",
+  currentCallLead.phone
+);
 } else if (!fullTranscript || fullTranscript.length < 10) {
-  updateGHL(
-    "follow_up",
-    "Seller answered but hung up before a full conversation."
-  );
+updateGHL(
+  "follow_up",
+  "Seller answered but hung up before a full conversation.",
+  currentCallLead.phone
+);
 } else {
   classifyCall(fullTranscript).then((result) => {
 updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
