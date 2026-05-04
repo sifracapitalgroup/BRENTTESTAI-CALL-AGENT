@@ -366,9 +366,11 @@ app.post("/call-status", async (req, res) => {
   try {
     console.log("CALL STATUS:", req.body);
 
-    const callStatus = req.body.CallStatus;
-
+const callStatus = req.body.CallStatus;
 const callDuration = Number(req.body.CallDuration || req.body.Duration || 0);
+const phone = req.body.To || req.body.Called;
+
+console.log("PHONE FROM TWILIO:", phone);
 
 if (
   callStatus === "no-answer" ||
@@ -376,9 +378,12 @@ if (
   callStatus === "failed" ||
   (callStatus === "completed" && callDuration <= 5)
 ) {
+  console.log("TRIGGERING GHL UPDATE FOR NO ANSWER");
+
   await updateGHL(
     "no_answer_voicemail",
-    `Call ended with status: ${callStatus} and duration ${callDuration} seconds. No meaningful conversation.`
+    `Call ended with status: ${callStatus} and duration ${callDuration} seconds.`,
+    phone
   );
 }
 
@@ -528,7 +533,7 @@ if (currentCallLead.city || currentCallLead.state) {
 
   return hardGoodbye || clearClose;
 }
-async function updateGHL(outcome, summary) {
+async function updateGHL(outcome, summary, phoneOverride) {
   try {
     const response = await fetch("https://services.leadconnectorhq.com/contacts/upsert", {
       method: "POST",
@@ -539,7 +544,7 @@ async function updateGHL(outcome, summary) {
       },
       body: JSON.stringify({
         locationId: process.env.GHL_LOCATION_ID,
-        phone: currentCallLead.phone,
+        phone: phoneOverride,
         customFields: [
           {
             key: "ai_call_outcome",
@@ -670,7 +675,7 @@ function scheduleEndCall(reason) {
   console.log("AUTO ENDING CALL:", reason);
 
   classifyCall(fullTranscript).then((result) => {
-    updateGHL(result.ai_call_outcome, result.call_summary);
+updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
   });
 
   setTimeout(async () => {
@@ -1000,7 +1005,7 @@ if (!sellerSpoke) {
   );
 } else {
   classifyCall(fullTranscript).then((result) => {
-    updateGHL(result.ai_call_outcome, result.call_summary);
+updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
   });
 }
 
