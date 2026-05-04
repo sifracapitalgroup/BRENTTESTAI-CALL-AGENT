@@ -533,12 +533,12 @@ async function updateGHL(outcome, summary) {
 
 async function classifyCall(transcript) {
   try {
-    if (!transcript || transcript.trim().length < 20) {
-      return {
-        ai_call_outcome: "no_answer_voicemail",
-        call_summary: "Call ended with little or no meaningful conversation.",
-      };
-    }
+  if (!transcript || transcript.trim().length < 10) {
+  return {
+    ai_call_outcome: "no_answer_voicemail",
+    call_summary: "No answer or voicemail reached.",
+  };
+}
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -563,9 +563,17 @@ Return ONLY valid JSON with:
 
 Rules:
 - no_answer_voicemail = no meaningful conversation, voicemail, no answer, immediate hangup
-- follow_up = unsure, maybe later, needs time, not enough info, unclear
-- interested = open to selling, gives price/timeline/condition, wants offer, wants next step
-- not_interested = clearly says no, stop calling, already sold, not selling
+- interested = seller is open to selling, gives price/timeline/condition, wants an offer, asks for next steps
+- not_interested = ANY clear rejection, including:
+  "not interested"
+  "stop calling"
+  "remove me"
+  "already sold"
+  "take me off your list"
+- follow_up = seller is unsure, says maybe later, asks to call back, needs time, or conversation is unclear
+
+CRITICAL:
+If the seller says "not interested" return "not_interested".
 
 If uncertain, choose follow_up.
 `,
@@ -926,9 +934,16 @@ if (msg.event === "stop") {
     callSid,
   });
 
-classifyCall(fullTranscript).then((result) => {
-  updateGHL(result.ai_call_outcome, result.call_summary);
-});
+if (!fullTranscript || fullTranscript.length < 10) {
+  updateGHL(
+    "no_answer_voicemail",
+    "Call ended with no meaningful conversation."
+  );
+} else {
+  classifyCall(fullTranscript).then((result) => {
+    updateGHL(result.ai_call_outcome, result.call_summary);
+  });
+}
 
   if (openAiWs.readyState === WebSocket.OPEN) {
     openAiWs.close();
