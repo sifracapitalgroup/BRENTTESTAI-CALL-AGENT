@@ -399,16 +399,17 @@ app.post("/call-status", async (req, res) => {
     console.log("CALL STATUS:", req.body);
 
 const callStatus = req.body.CallStatus;
-const callDuration = Number(req.body.CallDuration || req.body.Duration || 0);
+const callDuration = Number(req.body.Duration || req.body.CallDuration || 0);
 const phone = req.body.To || req.body.Called;
 
 console.log("PHONE FROM TWILIO:", phone);
+console.log("CALL DURATION USED:", callDuration);
 
 if (
   callStatus === "no-answer" ||
   callStatus === "busy" ||
   callStatus === "failed" ||
-  (callStatus === "completed" && callDuration <= 5)
+  (callStatus === "completed" && callDuration <= 15)
 ) {
   console.log("TRIGGERING GHL UPDATE FOR NO ANSWER");
 
