@@ -368,16 +368,19 @@ app.post("/call-status", async (req, res) => {
 
     const callStatus = req.body.CallStatus;
 
-    if (
-      callStatus === "no-answer" ||
-      callStatus === "busy" ||
-      callStatus === "failed"
-    ) {
-      await updateGHL(
-        "no_answer_voicemail",
-        `Call ended with status: ${callStatus}. No meaningful conversation.`
-      );
-    }
+const callDuration = Number(req.body.CallDuration || req.body.Duration || 0);
+
+if (
+  callStatus === "no-answer" ||
+  callStatus === "busy" ||
+  callStatus === "failed" ||
+  (callStatus === "completed" && callDuration <= 5)
+) {
+  await updateGHL(
+    "no_answer_voicemail",
+    `Call ended with status: ${callStatus} and duration ${callDuration} seconds. No meaningful conversation.`
+  );
+}
 
     res.sendStatus(200);
   } catch (err) {
