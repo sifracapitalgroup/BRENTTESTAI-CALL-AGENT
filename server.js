@@ -540,6 +540,29 @@ async function classifyCall(transcript) {
   };
 }
 
+const lowerTranscript = transcript.toLowerCase();
+
+const rejectionPhrases = [
+  "not interested",
+  "no thanks",
+  "i'm good",
+  "im good",
+  "stop calling",
+  "remove me",
+  "take me off",
+  "don't call",
+  "do not call",
+  "not selling",
+  "already sold",
+];
+
+if (rejectionPhrases.some((phrase) => lowerTranscript.includes(phrase))) {
+  return {
+    ai_call_outcome: "not_interested",
+    call_summary: "Seller clearly rejected the call or said they are not interested.",
+  };
+}
+    
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -833,6 +856,7 @@ async function speakWithElevenLabs(text) {
 // ✅ THEN this
 let assistantText = "";
 let fullTranscript = "";
+let sellerSpoke = false;
   
 // ✅ THEN your OpenAI handler
 
@@ -842,10 +866,11 @@ openAiWs.on("message", (data) => {
     console.log("OPENAI EVENT:", event.type);
 
     // capture seller speech
-    if (event.type === "conversation.item.input_audio_transcription.completed") {
-      fullTranscript += `\nSeller: ${event.transcript}`;
-      console.log("SELLER SAID:", event.transcript);
-    }
+if (event.type === "conversation.item.input_audio_transcription.completed") {
+  sellerSpoke = true;
+  fullTranscript += `\nSeller: ${event.transcript}`;
+  console.log("SELLER SAID:", event.transcript);
+}
 
     // collect AI streaming text
     if (event.type === "response.text.delta" && event.delta) {
@@ -934,10 +959,15 @@ if (msg.event === "stop") {
     callSid,
   });
 
-if (!fullTranscript || fullTranscript.length < 10) {
+if (!sellerSpoke) {
   updateGHL(
     "no_answer_voicemail",
-    "Call ended with no meaningful conversation."
+    "No answer or voicemail reached. No meaningful seller response."
+  );
+} else if (!fullTranscript || fullTranscript.length < 10) {
+  updateGHL(
+    "follow_up",
+    "Seller answered but hung up before a full conversation."
   );
 } else {
   classifyCall(fullTranscript).then((result) => {
