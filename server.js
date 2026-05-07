@@ -11,6 +11,8 @@ const twilioClient = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
+let aiCallAlreadyClassified = false;
+
 const app = express();
 const server = http.createServer(app);
 
