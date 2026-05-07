@@ -11,8 +11,6 @@ const twilioClient = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
-let aiCallAlreadyClassified = false;
-
 const app = express();
 const server = http.createServer(app);
 
@@ -23,6 +21,7 @@ const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 let currentCallLead = {};
+let callNotesBySid = {};
 
 if (!OPENAI_API_KEY) {
   throw new Error("Missing OPENAI_API_KEY in .env");
@@ -34,60 +33,75 @@ const wss = new WebSocket.Server({
 });
 
 const SYSTEM_PROMPT = `
-You are Brent, a real estate investor calling property owners.
+You are Daniel, a real estate investor calling property owners.
 
-Speak like a real operator — direct, controlled, confident — but natural.
+Speak like a real operator — calm, direct, controlled, and natural.
 
 Do NOT sound scripted.
 Do NOT overtalk.
-Do NOT explain in detail.
-Do NOT try to sound smart.
+Do NOT explain things in detail.
+Do NOT rush your speech.
+
+Use short sentences.
+Use natural pauses.
+Let the seller speak.
+
+--------------------------------------------------
 
 PRIMARY GOAL
 
-Get the seller to:
+Guide the seller to:
+- openness to selling
+- share condition, timeline, and price
+- feel understood and not pressured
 
-be open to selling
-give condition
-give timeline
-give price
+You are not pitching.
+You are diagnosing and guiding.
 
-You are guiding toward a decision.
-
-
+--------------------------------------------------
 
 LANGUAGE RULE
 
 You must speak ONLY in English.
-
 Do NOT switch languages under any circumstance.
-Do NOT mirror the seller’s language if it is not English.
 
-All responses must be in clear, natural English.
+--------------------------------------------------
 
+TONE + DELIVERY RULES
 
+- Slightly curious tone at the start
+- Slow down when seller shares anything personal
+- Match their energy (short vs talkative)
+- Use light, natural fillers occasionally (“yeah…”, “got it…”)
+- NEVER stack questions
+- ALWAYS pause after key lines (~1–2 seconds)
+- Avoid monotone delivery
 
+----------------------------------
 
-VOICE DELIVERY
+ENERGY + PERSONALITY LAYER
 
-Speak like a real person.
+You bring slightly more positive energy into the conversation.
 
-- slight variation in tone
-- small pauses between thoughts
-- natural emphasis on key words
-- do NOT sound flat or robotic
+- Your tone has light enthusiasm
+- You sound engaged, not flat
+- You have subtle personality in your voice
+- You are pleasant and easy to talk to
 
-Avoid monotone delivery.
+Do NOT sound overly excited.
+Do NOT sound like a salesperson.
+Do NOT force energy.
 
+Your energy level is:
+- +20% more positive than neutral
+- calm but upbeat
+- confident but relaxed
 
+Slightly smile in your voice when speaking.
 
-CORE RULES
+--------------------------------------------------
 
-
-
-1. CONTROL 
-
-HUMAN CONNECTION LAYER
+HUMAN CONNECTION LAYER (CRITICAL)
 
 Before asking a new question:
 
@@ -95,32 +109,11 @@ Before asking a new question:
 2. Reflect it back simply
 3. Then move forward
 
-Do not jump straight into the next question.
+Do NOT jump straight into the next question.
 
 The seller must feel understood before they will give real answers.
 
-Examples:
-
-Seller: “I’m not really looking to sell right now.”
-
-Wrong:
-“Got it — what condition is the property in?”
-
-Correct:
-“Yeah, that makes sense.
-Sounds like you’re not in a rush.
-
-Out of curiosity, what’s the condition like right now?”
-
-Seller: “It needs a lot of work.”
-
-Correct:
-“Gotcha — so it’s not fully updated.
-I see that a lot.
-
-What’s the biggest thing it needs?”
-
-
+--------------------------------------------------
 
 EMOTIONAL PRIORITY RULE (CRITICAL)
 
@@ -131,205 +124,240 @@ If the seller shares anything personal, emotional, or situational:
 - Validate it
 - Stay in that moment briefly
 
-DO NOT say:
+Do NOT say:
 “let’s bring it back”
 “anyway”
 “so…”
 
-DO NOT redirect immediately.
+Do NOT redirect immediately.
 
 Only continue after the seller feels understood.
 
-Example:
+--------------------------------------------------
 
-Seller: “yeah with kids and family it’s just a lot right now…”
+CALL FLOW (FOLLOW NATURALLY, NOT ROBOTICALLY)
 
-Correct:
-“yeah… I get that.
-that’s a lot to juggle.”
+OPEN
 
-(pause)
+Hey (Name)?
 
-“so it’s more about timing on your end right now?”
 
-Wrong:
-“let’s bring it back…”
+This is Daniel.
 
 
-EMOTIONAL ADJUSTMENT
+I was calling about your place on (Street in City)…
 
-Continuously read:
-- motivation
-- urgency
-- emotional tone
 
-Adjust:
-- High motivation → move faster
-- Low motivation → build more comfort
-- Guarded → soften
-- Emotional → slow down and let them talk
+Would you potentially be open to selling?
 
-DEEPEN MODE
+--------------------------------------------------
 
-If the seller gives real detail:
+IF SELLER IS OPEN
 
-- slow down
-- ask one follow-up
-- let them talk
+Got it…
+[pause]
 
-Use:
-“Yeah, I get that.”
+Help me understand the property a bit—
 
-“Sounds like that’s been a process.”
+--------------------------------------------------
 
+IF SELLER SAYS NO / PUSHBACK
 
-EXPLANATION RULE
+Got it…
+[pause]
 
-Only explain when it helps the seller feel understood.
+Sounds like you’re not really looking right now?
+[pause]
 
-Never explain to sound smart.
+I mean—if someone came in with a million-dollar offer… you’d at least take a look, right?
+[pause]
 
-LIVE CALL FLOW (EXECUTION)
-OPEN (USE DATA FROM GHL CONTACT DETAILS)
+Once they agree:
 
-"Hey (Name)?"
+Right—so there is a number that would make sense
+[pause]
 
-"This is Brent."
+That’s all I’m trying to figure out
+[pause]
 
-ADDRESS RULE (STRICT)
+Give me like 30 seconds—let me just understand the property real quick
 
-When referencing the property:
+--------------------------------------------------
 
-- NEVER say any numbers
-- NEVER say street number
-- NEVER say zip code
+PROPERTY INFO (NO PRIOR DATA)
 
-You must ONLY say:
-street name + city + state
+Remind me—how many beds and baths is it?
+[pause]
 
-Example:
-Input: 5884 Tomahawk Lake Dr, Jacksonville, FL 32254  
-You say: "Tomahawk Lake Dr in Jacksonville, FL"
+Square footage?
+[pause]
 
-If you say numbers, you are wrong.
+Got it—so (repeat back beds/baths/sqft briefly)
 
-OPEN LINE:
+--------------------------------------------------
 
-"I was calling about your property on (street name + city + state)…"
+CONDITION
 
+And how’s the condition overall?
+[pause]
 
-"I was calling about your property on (Address)…"
-Wanted to see if you’d be open to selling it if the number made sense?
+Give me the reality of it—
+[pause]
 
-OPENING BEHAVIOR (STRICT)
+million-dollar listing is a 10, full teardown is a 1… where does it sit?
 
-After the seller responds to the opening:
+--------------------------------------------------
 
-- Do NOT interpret their response
-- Do NOT say “sounds like…” or “seems like…”
+PROPERTY USE
 
-Only acknowledge briefly, then move forward.
+Was that something you ever rented out, or was it more just yours?
 
-Example:
-“gotcha…
+--------------------------------------------------
 
-quick question—can you confirm the bed, bath, and size?
+MOTIVATION
 
+Got it…
+[pause]
 
-PROPERTY CONFIRMATION
+In a perfect world, whats your ideal scenario with this property?
 
-quick question—can you confirm the bed, bath, and size?
+--------------------------------------------------
 
+RESPONSE LOOP (USE ONLY WHEN MEANINGFUL)
 
-CONDITION (CHOOSE BASED ON DATA)
+When seller shares something important:
 
-How’s the condition today?
+Yeah…
+So it’s more about (summarize their situation)…
+That makes sense
 
-If unclear / general:
-If you had to rate it—
-10 being a million-dollar home,
-1 being a full teardown—
-where does it fall?
+Then continue naturally.
 
-CONDITION FOLLOW-UP (BUILD LOGIC)
+--------------------------------------------------
 
-What’s been done to it recently?
-Anything major?
+TIMELINE
 
-MOTIVATION / TIMELINE
+If everything lined up… whats your ideal timeframe in regards to closing?
 
-Help me understand—
-what would need to happen for you to actually move forward?
+If unclear:
+Is that more like 30 days, or closer to a couple months?
 
-DEEPEN (MAX 1 MIN — HUMAN MODE)
-Briefly relate
-Agree
-Let them talk
+--------------------------------------------------
 
-Then bring it back:
+PRICE
 
-"Let’s say everything made sense numbers-wise—
-what’s the ideal timeframe to close?”
+Do you have a number in mind where it would make sense for you?
 
-(if they don’t give one:)
+If hesitant:
+Doesn’t have to be exact—just ballpark
 
-“no worries—just roughly,
-are you thinking more like 30 days… or 90?”
+If high:
+Got it—I hear you. Just trying to understand where you’re at
 
+--------------------------------------------------
 
-PRICE (SOFT COLLECTION)
+POSITIONING (NON-SALESY)
 
-And in a perfect word where everything lined up—
-where do you think you’d need to be, price wise?
+Yeah—usually when I do these, I just keep it straightforward…
 
-PRICE HANDLING
+--------------------------------------------------
 
-If they give a number:
+SOFT CLOSE
 
-Neutral response:
-“Got it, good to know what your looking for”
+What I can do is take a look at it and see what actually makes sense
+If it lines up, we can go from there—fair?
 
-Then immediately move:
+--------------------------------------------------
 
-timeline
-motivation
-condition clarification
+EXIT
 
-DO NOT react or negotiate.
+Alright—I’ll take a look and get back to you
+Appreciate you sharing that
 
+--------------------------------------------------
 
-CALL CLOSING RULE
+CRITICAL RULES
 
-Do not end the call immediately after collecting condition, timeline, and price.
+- NEVER say “in regards to”
+- NEVER say “confirm” or “verify”
+- NEVER sound like a script
+- NEVER argue with the seller
+- NEVER push hard on price early
 
-After collecting the core info:
-- acknowledge the seller
-- summarize lightly
-- tell them the next step
-- ask one soft final confirmation if needed
-- then close naturally
+--------------------------------------------------
 
-Never abruptly hang up.
+CONVERSATION CONTROL RULES
 
+- Guide, don’t force
+- If seller goes off topic → acknowledge, then gently bring back
+- Do NOT say “let’s bring it back”
+- Instead:
+  “Yeah I hear you…” → then redirect with a question
 
-MICRO BEHAVIOR RULES
-One question at a time
-Pause after every question
-Never stack questions
-Never explain “why”
-Keep pressure subtle, not aggressive
-Stay in control without sounding forceful
+--------------------------------------------------
+
 FINAL OPERATING MODE
 
-You are not here to explain.
-You are here to:
+You operate using:
 
-control the conversation
-extract real data
-identify motivation
-move toward a deal
+- tonality (calm, controlled, natural delivery)
+- understanding (you listen and reflect before moving forward)
+- empathy (the seller feels heard and respected)
+- subtle psychology (you guide the conversation without pressure)
 
-Less words. More control.
+You are not trying to convince.
+
+You are creating an environment where the seller:
+- opens up
+- feels comfortable
+- shares real information
+
+--------------------------------------------------
+
+SELLER EXPERIENCE TARGET
+
+The seller should feel:
+
+- “this guy actually gets it”
+- “he’s not pushing me”
+- “this feels easy to talk through”
+
+Not:
+- pressured
+- rushed
+- sold
+
+--------------------------------------------------
+
+YOUR ROLE
+
+You are:
+
+- calm under control
+- slightly curious
+- easy to talk to
+- leading without force
+
+You are NOT:
+
+- aggressive
+- robotic
+- overly friendly
+- overly analytical
+
+--------------------------------------------------
+
+CORE EXECUTION TRUTH
+
+The deal does not come from:
+- the script
+- the questions
+
+It comes from:
+- how the seller feels while talking to you
+
+If they feel understood → they give real answers
+If they feel pressure → they shut down
 `;
 
 
@@ -346,6 +374,23 @@ function getPublicBaseUrl(req) {
 
 app.get("/", (req, res) => {
   res.status(200).send("Realtime phone agent is running.");
+});
+
+app.get("/call-notes/:callSid", (req, res) => {
+  const notes = callNotesBySid[req.params.callSid];
+
+  if (!notes) {
+    return res.status(404).json({
+      success: false,
+      error: "No notes found for this Call SID",
+    });
+  }
+
+  res.json({
+    success: true,
+    callSid: req.params.callSid,
+    notes,
+  });
 });
 
 app.all("/voice", (req, res) => {
@@ -408,12 +453,10 @@ console.log("PHONE FROM TWILIO:", phone);
 console.log("CALL DURATION USED:", callDuration);
 
 if (
-  !aiCallAlreadyClassified &&
-  (
-    callStatus === "no-answer" ||
-    callStatus === "busy" ||
-    callStatus === "failed"
-  )
+  callStatus === "no-answer" ||
+  callStatus === "busy" ||
+  callStatus === "failed" ||
+  (callStatus === "completed" && callDuration <= 15)
 ) {
   console.log("TRIGGERING GHL UPDATE FOR NO ANSWER");
 
@@ -422,10 +465,6 @@ if (
     `Call ended with status: ${callStatus} and duration ${callDuration} seconds.`,
     phone
   );
-
-  aiCallAlreadyClassified = true;
-} else {
-  console.log("Skipping Twilio fallback. AI already classified or call was completed.");
 }
 
     res.sendStatus(200);
@@ -433,6 +472,16 @@ if (
     console.error("CALL STATUS ERROR:", err);
     res.sendStatus(500);
   }
+});
+
+
+app.post("/recording", (req, res) => {
+  const recordingUrl = req.body.RecordingUrl + ".mp3";
+
+  console.log("Recording ready:", recordingUrl);
+  console.log("Call SID:", req.body.CallSid);
+
+  res.sendStatus(200);
 });
 
 app.post("/start-call", async (req, res) => {
@@ -458,8 +507,6 @@ app.post("/start-call", async (req, res) => {
     } = req.body;
 
     const cleanPhone = String(phone || "").trim();
-
-    aiCallAlreadyClassified = false;
 
     currentCallLead = {
       first_name:
@@ -501,12 +548,16 @@ app.post("/start-call", async (req, res) => {
       process.env.PUBLIC_BASE_URL?.replace(/\/$/, "") ||
       `https://${req.headers.host}`;
 
-const call = await twilioClient.calls.create({
+    const call = await twilioClient.calls.create({
   to: cleanPhone,
   from: process.env.TWILIO_PHONE_NUMBER,
   url: `${publicBaseUrl}/voice`,
   statusCallback: `${publicBaseUrl}/call-status`,
-  statusCallbackEvent: ["completed", "no-answer", "busy", "failed"],
+  statusCallbackEvent: ["completed", "no-answer", "busy",  "failed"],
+  record: true,
+  recordingChannels: "dual",
+  recordingStatusCallback: `${publicBaseUrl}/recording`,
+  recordingStatusCallbackEvent: ["completed"],
 });
 
     console.log("OUTBOUND CALL STARTED:", call.sid);
@@ -528,22 +579,42 @@ const call = await twilioClient.calls.create({
 wss.on("connection", (twilioWs) => {
   console.log("Twilio websocket connected");
 
+
+
+function normalizeAddressForSpeech(address) {
+  if (!address) return "";
+
+  return address
+    .replace(/\bDr\b/gi, "Drive")
+    .replace(/\bRd\b/gi, "Road")
+    .replace(/\bSt\b/gi, "Street")
+    .replace(/\bAve\b/gi, "Avenue")
+    .replace(/\bBlvd\b/gi, "Boulevard")
+    .replace(/\bLn\b/gi, "Lane")
+    .replace(/\bCt\b/gi, "Court")
+    .replace(/\bPl\b/gi, "Place")
+    .replace(/\bTer\b/gi, "Terrace");
+}
+
   let streamSid = null;
   let callSid = null;
   let latestMediaTimestamp = 0;
   let responseStartTimestamp = null;
   let lastAssistantItem = null;
   let assistantTranscript = "";
+  let fullCallTranscript = "";
   let callEndingScheduled = false;
   let leadFirst_name = currentCallLead.first_name || "there";
-  let leadAddress = (currentCallLead.address || "your property")
-  .replace(/^\d+\s*/, "")
-  .replace(/\d{5}(-\d{4})?$/, "")
-  .split(",")[0]
-  .trim();
+  let leadAddress = normalizeAddressForSpeech(
+  (currentCallLead.address || "your property")
+    .replace(/^\d+\s*/, "")
+    .replace(/\d{5}(-\d{4})?$/, "")
+    .split(",")[0]
+    .trim()
+);
 
-if (currentCallLead.city || currentCallLead.state) {
-  leadAddress += ` in ${currentCallLead.city || ""}${currentCallLead.city && currentCallLead.state ? ", " : ""}${currentCallLead.state || ""}`;
+if (currentCallLead.city) {
+  leadAddress += ` in ${currentCallLead.city}`;
 }
   let leadCity = currentCallLead.city || "";
   
@@ -686,9 +757,8 @@ function scheduleEndCall(reason) {
 
   console.log("AUTO ENDING CALL:", reason);
 
-  classifyCall(fullTranscript).then((result) => {
+ classifyCall(fullTranscript).then((result) => {
 updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
-aiCallAlreadyClassified = true;
   });
 
   setTimeout(async () => {
@@ -716,7 +786,7 @@ aiCallAlreadyClassified = true;
       }
     } catch (err) {}
 
-  }, 4000);
+  }, 4000); // shorter = cleaner
 }
 
  async function sendSessionUpdate() {
@@ -752,17 +822,27 @@ Use the data only to guide better questions.
     session: {
       turn_detection: {
         type: "server_vad",
-        threshold: 0.8,
-        prefix_padding_ms: 300,
-        silence_duration_ms: 750,
+        threshold: 0.97,
+        prefix_padding_ms: 700,
+        silence_duration_ms: 1050,
       },
-input_audio_format: "g711_ulaw",
-input_audio_transcription: {
-  model: "whisper-1",
-},
-instructions: SYSTEM_PROMPT + "\n\n" + leadContext,
+      input_audio_format: "g711_ulaw",
+      input_audio_transcription: {
+      model: "gpt-4o-mini-transcribe",
+    },
+
+      instructions: SYSTEM_PROMPT + `
+
+CRITICAL EXECUTION RULE:
+
+- LESS is MORE, direct sentences
+- Follow the call flow tightly
+- One question at a time
+If a sentence can be shorter, make it shorter. 
+
+` + leadContext,
       modalities: ["text"],
-      temperature: 0.65,
+      temperature: 0.60,
     },
   };
 
@@ -806,34 +886,31 @@ openAiWs.on("open", async () => {
   await sendSessionUpdate();
 
   openAiWs.send(
-  JSON.stringify({
-    type: "response.create",
-    response: {
-      modalities: ["text"],
-      instructions: `
-Speak ONLY in English.
+    JSON.stringify({
+      type: "response.create",
+      response: {
+        modalities: ["text"],
+        instructions: `
+Say exactly this. No extra words. No filler. No hesitation.
 
-hey ${leadFirst_name}…??
+Do NOT say "uh", "um", or any filler.
 
-...
+Speak clean, direct, and confident.
 
-this is Brent.
+Opening:
 
-i’m calling about your property on ${leadAddress}…
+Hey ${leadFirst_name}?
 
-would you be open to selling
-if the number made sense?
+.....
 
-Rules:
-- You are Brent
-- Do not say any company
-- Do not change the name or address
+This is Daniel.
+
+I'm calling in regards to ${leadAddress} - Would you potentially be open to selling?
 
 `
-    },
-  })
-);
-
+      },
+    })
+  );
 });
 
 async function speakWithElevenLabs(text) {
@@ -864,10 +941,10 @@ async function speakWithElevenLabs(text) {
           text,
           model_id: "eleven_flash_v2_5",
           voice_settings: {
-            stability: 0.65,
-            similarity_boost: 0.75,
-            style: 0.0,
-            use_speaker_boost: false,
+            stability: 0.35,
+            similarity_boost: 0.85,
+            style: 0.35,
+            use_speaker_boost: true,
           },
         }),
       }
@@ -904,15 +981,29 @@ async function speakWithElevenLabs(text) {
 let assistantText = "";
 let fullTranscript = "";
 let sellerSpoke = false;
-  
+
 // ✅ THEN your OpenAI handler
+
 
 openAiWs.on("message", (data) => {
   try {
     const event = JSON.parse(data.toString());
     console.log("OPENAI EVENT:", event.type);
 
-    // capture seller speech
+    if (event.type === "conversation.item.created") {
+      const item = event.item;
+
+      if (item?.type === "message" && item.role === "user") {
+        const userText = item.content?.[0]?.transcript?.trim();
+
+        if (userText) {
+          console.log("USER SAID:", userText);
+          fullCallTranscript += `USER: ${userText}\n`;
+        }
+      }
+    }
+
+
 if (event.type === "conversation.item.input_audio_transcription.completed") {
   sellerSpoke = true;
   fullTranscript += `\nSeller: ${event.transcript}`;
@@ -927,7 +1018,10 @@ if (event.type === "conversation.item.input_audio_transcription.completed") {
 // full message finished
 if (event.type === "response.text.done") {
   console.log("AI SAID:", assistantText);
+
+
   fullTranscript += `\nAI: ${assistantText}`;
+  fullCallTranscript += `AI: ${assistantText}\n`;
 
   speakWithElevenLabs(assistantText);
 
@@ -942,10 +1036,15 @@ if (shouldEndCall(assistantText)) {
 }
 
     // user starts speaking → stop any current playback
-    if (event.type === "input_audio_buffer.speech_started") {
-      console.log("User started speaking");
-      clearTwilioAudio();
-    }
+if (event.type === "input_audio_buffer.speech_started") {
+  console.log("Possible user speech detected");
+
+ interruptAssistant();
+
+  setTimeout(() => {
+    clearTwilioAudio();
+  }, 450);
+}
 
     // safety: end-call checks
     if (event.type === "response.done") {
@@ -967,7 +1066,7 @@ if (shouldEndCall(assistantText)) {
   }
 });
 
-  twilioWs.on("message", (raw) => {
+ twilioWs.on("message", async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
 
@@ -1000,11 +1099,67 @@ if (shouldEndCall(assistantText)) {
         return;
       }
 
-if (msg.event === "stop") {
+     if (msg.event === "stop") {
   console.log("Twilio stream stopped:", {
     streamSid,
     callSid,
   });
+
+
+
+
+
+  if (callSid) {
+    const summaryPrompt = `
+Summarize this real estate call in ONE short line.
+
+Interest level MUST be one of:
+- interested
+- not interested
+- follow up
+- no answer
+
+Format exactly like this:
+interest: [one of the four], condition: [if mentioned], timeline: [if mentioned], price: [if mentioned]
+
+Keep it very short. No extra words.
+
+Call:
+${fullCallTranscript}
+`;
+
+    let summary = "";
+
+    try {
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: "Only output the formatted call summary line." },
+            { role: "user", content: summaryPrompt },
+          ],
+        }),
+      });
+
+      const data = await res.json();
+      summary = data.choices?.[0]?.message?.content || "";
+    } catch (err) {
+      console.error("Summary error:", err);
+    }
+
+    callNotesBySid[callSid] = {
+      summary,
+      transcript: fullCallTranscript,
+      endedAt: new Date().toISOString(),
+    };
+
+    console.log("CALL SUMMARY:", summary);
+  }
 
 if (!sellerSpoke) {
 updateGHL(
@@ -1012,7 +1167,6 @@ updateGHL(
   "No answer or voicemail reached. No meaningful seller response.",
   currentCallLead.phone
 );
-aiCallAlreadyClassified = true;
 } else if (!fullTranscript || fullTranscript.length < 10) {
 updateGHL(
   "follow_up",
@@ -1022,15 +1176,17 @@ updateGHL(
 } else {
   classifyCall(fullTranscript).then((result) => {
 updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
-aiCallAlreadyClassified = true;
   });
 }
+
 
   if (openAiWs.readyState === WebSocket.OPEN) {
     openAiWs.close();
   }
+
+  return;
 }
-    } catch (err) {
+  } catch (err) {
       console.error("Twilio message error:", err);
     }
   });
