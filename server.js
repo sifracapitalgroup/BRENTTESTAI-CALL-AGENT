@@ -408,10 +408,12 @@ console.log("PHONE FROM TWILIO:", phone);
 console.log("CALL DURATION USED:", callDuration);
 
 if (
-  callStatus === "no-answer" ||
-  callStatus === "busy" ||
-  callStatus === "failed" ||
-  (callStatus === "completed" && callDuration <= 15)
+  !aiCallAlreadyClassified &&
+  (
+    callStatus === "no-answer" ||
+    callStatus === "busy" ||
+    callStatus === "failed"
+  )
 ) {
   console.log("TRIGGERING GHL UPDATE FOR NO ANSWER");
 
@@ -420,6 +422,10 @@ if (
     `Call ended with status: ${callStatus} and duration ${callDuration} seconds.`,
     phone
   );
+
+  aiCallAlreadyClassified = true;
+} else {
+  console.log("Skipping Twilio fallback. AI already classified or call was completed.");
 }
 
     res.sendStatus(200);
@@ -452,6 +458,8 @@ app.post("/start-call", async (req, res) => {
     } = req.body;
 
     const cleanPhone = String(phone || "").trim();
+
+    aiCallAlreadyClassified = false;
 
     currentCallLead = {
       first_name:
@@ -680,6 +688,7 @@ function scheduleEndCall(reason) {
 
   classifyCall(fullTranscript).then((result) => {
 updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
+aiCallAlreadyClassified = true;
   });
 
   setTimeout(async () => {
@@ -1003,6 +1012,7 @@ updateGHL(
   "No answer or voicemail reached. No meaningful seller response.",
   currentCallLead.phone
 );
+aiCallAlreadyClassified = true;
 } else if (!fullTranscript || fullTranscript.length < 10) {
 updateGHL(
   "follow_up",
@@ -1012,6 +1022,7 @@ updateGHL(
 } else {
   classifyCall(fullTranscript).then((result) => {
 updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
+aiCallAlreadyClassified = true;
   });
 }
 
