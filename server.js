@@ -815,6 +815,9 @@ wss.on("connection", (twilioWs) => {
   let lastAssistantItem = null;
   let fullCallTranscript = "";
   let callState = CALL_STATE.IDLE;
+  let assistantTextBuffer = "";
+  let elevenWs = null;
+  let elevenBuffer = "";
   /** Post-opener seller lines appended to fullTranscript for classification. */
   let sellerEngagedPostOpener = false;
   /** Any completed seller transcription (legacy sellerSpoke semantics for CRM). */
@@ -1020,7 +1023,7 @@ Mention the property address naturally.
   type: "session.update",
   session: {
   type: "realtime",
-  output_modalities: ["audio"],
+  output_modalities: ["text"],
 
   instructions:
     openerBlock +
@@ -1047,18 +1050,9 @@ Mention the property address naturally.
         create_response: false,
         interrupt_response: true,
       }
-    },
-
-    output: {
-      format: {
-        type: "audio/pcmu"
-      },
-
-      voice: "cedar"
     }
   }
-  }
-};
+
    
 console.log(
   "SESSION UPDATE SENT:",
@@ -1181,7 +1175,46 @@ openAiWs.on("open", async () => {
   console.log("Connected to OpenAI Realtime");
 
   callState = CALL_STATE.OPENING;
+elevenWs = new WebSocket(
+  `wss://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}/stream-input?output_format=ulaw_8000&model_id=eleven_flash_v2_5`,
+  {
+    headers: {
+      "xi-api-key": process.env.ELEVENLABS_API_KEY,
+    },
+  }
+);
 
+elevenWs.on("open", () => {
+  console.log("Connected to ElevenLabs");
+  
+  elevenWs.send(JSON.stringify({
+  text: " ",
+  voice_settings: {
+    stability: 0.45,
+    similarity_boost: 0.85,
+    style: 0.2,
+    use_speaker_boost: true
+  }
+}));
+});
+
+elevenWs.on("message", (data) => {
+
+  const audioChunk = JSON.parse(data.toString());
+
+  if (audioChunk.audio) {
+    forwardAssistantAudioToTwilio(audioChunk.audio);
+  }
+
+});
+
+elevenWs.on("error", (err) => {
+  console.error("ElevenLabs websocket error:", err);
+});
+
+elevenWs.on("close", () => {
+  console.log("ElevenLabs websocket closed");
+});
   
   await sendSessionUpdate();
 
@@ -1201,7 +1234,48 @@ openAiWs.on("message", (data) => {
   try {
     const event = JSON.parse(data.toString());
     console.log("OPENAI EVENT:", event.type);
+    
+if (event.type === "response.text.delta") {
 
+  assistantTextBuffer += event.delta;
+
+  elevenBuffer += event.delta;
+
+  console.log("AI TEXT DELTA:", event.delta);
+
+  const shouldFlush =
+    elevenBuffer.includes(".") ||
+    elevenBuffer.includes("?") ||
+    elevenBuffer.includes("!") ||
+    elevenBuffer.includes(",") ||
+    elevenBuffer.length > 120;
+
+  if (
+    shouldFlush &&
+    elevenWs &&
+    elevenWs.readyState === WebSocket.OPEN
+  ) {
+
+    elevenWs.send(JSON.stringify({
+      text: elevenBuffer
+    }));
+
+    console.log("SENT TO ELEVEN:", elevenBuffer);
+
+    elevenBuffer = "";
+  }
+
+}
+  
+
+    elevenWs.send(JSON.stringify({
+      text: event.delta
+    }));
+
+  }
+
+}
+    
     if (event.type === "response.output_audio.delta") {
 
   console.log("AUDIO DELTA RECEIVED");
@@ -1422,17 +1496,36 @@ if (event.type === "input_audio_buffer.speech_started") {
 
 
     // safety: end-call checks
-    if (event.type === "response.done") {
-      if (openerInProgress) {
-        openerInProgress = false;
+   if (event.type === "response.done") {
 
-        if (callState === CALL_STATE.OPENING) {
-          callState = CALL_STATE.LISTENING;
-          console.log("OPENER ACTUALLY FINISHED → LISTENING");
-        }
-      }
+  if (
+    elevenBuffer &&
+    elevenWs &&
+    elevenWs.readyState === WebSocket.OPEN
+  ) {
 
-      const text = JSON.stringify(event);
+    elevenWs.send(JSON.stringify({
+      text: elevenBuffer
+    }));
+
+    console.log("FINAL ELEVEN FLUSH:", elevenBuffer);
+
+    elevenBuffer = "";
+  }
+
+  if (openerInProgress) {
+    openerInProgress = false;
+
+    if (callState === CALL_STATE.OPENING) {
+      callState = CALL_STATE.LISTENING;
+
+      console.log("OPENER ACTUALLY FINISHED → LISTENING");
+    }
+  }
+
+  const text = JSON.stringify(event);
+
+  
 
       if (shouldEndCall(text)) {
         scheduleEndCall(text);
