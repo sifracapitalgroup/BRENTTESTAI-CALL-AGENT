@@ -22,6 +22,20 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 let currentCallLead = {};
 let callNotesBySid = {};
+/** Twilio recording webhooks often omit `To`/`Called`; map parent CallSid → dialed E.164. */
+const callSidToLeadPhone = new Map();
+
+function buildGhlContactsUpsertUrl(identifier) {
+  const trimmed = String(identifier || "").trim();
+  if (!trimmed) return null;
+  const u = new URL("https://services.leadconnectorhq.com/contacts/upsert");
+  if (trimmed.includes("@")) {
+    u.searchParams.set("email", trimmed);
+  } else {
+    u.searchParams.set("number", trimmed);
+  }
+  return u.toString();
+}
 
 if (!OPENAI_API_KEY) {
   throw new Error("Missing OPENAI_API_KEY in .env");
@@ -32,333 +46,470 @@ const wss = new WebSocket.Server({
   path: "/media-stream",
 });
 
+/** Lightweight call lifecycle (single source of truth for mode gating). */
+const CALL_STATE = Object.freeze({
+  IDLE: "IDLE",
+  OPENING: "OPENING",
+  LISTENING: "LISTENING",
+  RESPONDING: "RESPONDING",
+  INTERRUPTING: "INTERRUPTING",
+  VOICEMAIL: "VOICEMAIL",
+  WRONG_NUMBER: "WRONG_NUMBER",
+  ENDING: "ENDING",
+  ENDED: "ENDED",
+});
+
+const US_STATE_BY_ABBREV = Object.freeze({
+  AL: "Alabama",
+  AK: "Alaska",
+  AZ: "Arizona",
+  AR: "Arkansas",
+  CA: "California",
+  CO: "Colorado",
+  CT: "Connecticut",
+  DE: "Delaware",
+  DC: "Washington D.C.",
+  FL: "Florida",
+  GA: "Georgia",
+  HI: "Hawaii",
+  ID: "Idaho",
+  IL: "Illinois",
+  IN: "Indiana",
+  IA: "Iowa",
+  KS: "Kansas",
+  KY: "Kentucky",
+  LA: "Louisiana",
+  ME: "Maine",
+  MD: "Maryland",
+  MA: "Massachusetts",
+  MI: "Michigan",
+  MN: "Minnesota",
+  MS: "Mississippi",
+  MO: "Missouri",
+  MT: "Montana",
+  NE: "Nebraska",
+  NV: "Nevada",
+  NH: "New Hampshire",
+  NJ: "New Jersey",
+  NM: "New Mexico",
+  NY: "New York",
+  NC: "North Carolina",
+  ND: "North Dakota",
+  OH: "Ohio",
+  OK: "Oklahoma",
+  OR: "Oregon",
+  PA: "Pennsylvania",
+  RI: "Rhode Island",
+  SC: "South Carolina",
+  SD: "South Dakota",
+  TN: "Tennessee",
+  TX: "Texas",
+  UT: "Utah",
+  VT: "Vermont",
+  VA: "Virginia",
+  WA: "Washington",
+  WV: "West Virginia",
+  WI: "Wisconsin",
+  WY: "Wyoming",
+});
+
+function normalizeAddressForSpeech(address) {
+if (!address) return "";
+
+return address
+.replace(/\bN\b/gi, "North")
+.replace(/\bS\b/gi, "South")
+.replace(/\bE\b/gi, "East")
+.replace(/\bW\b/gi, "West")
+.replace(/\bDr\b/gi, "Drive")
+.replace(/\bRd\b/gi, "Road")
+.replace(/\bSt\b/gi, "Street")
+.replace(/\bAve\b/gi, "Avenue")
+.replace(/\bBlvd\b/gi, "Boulevard")
+.replace(/\bLn\b/gi, "Lane")
+.replace(/\bCt\b/gi, "Court")
+.replace(/\bPl\b/gi, "Place")
+.replace(/\bTer\b/gi, "Terrace");
+}
+
+
+function formatSellerFirstName(firstRaw) {
+  const t = String(firstRaw || "").trim();
+  if (!t) return "there";
+  return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
+}
+
+function expandUsStateForSpeech(stateRaw) {
+  const raw = String(stateRaw || "").trim();
+  if (!raw) return "";
+  const compact = raw.replace(/\./g, "").toUpperCase();
+  if (compact.length === 2 && US_STATE_BY_ABBREV[compact]) {
+    return US_STATE_BY_ABBREV[compact];
+  }
+  return raw
+    .split(/\s+/)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
+}
+
+/** Street line only: no leading house numbers, no ZIP, first comma segment. */
+function extractStreetLineForSpeech(addressRaw) {
+  let line = String(addressRaw || "").trim();
+  if (!line) line = "your property";
+  line = line.split(",")[0].trim();
+  line = line.replace(/^\d+[-A-Za-z]?\s+/, "").trim();
+  line = line.replace(/\s+\d{5}(-\d{4})?$/i, "").trim();
+  line = normalizeAddressForSpeech(line).trim();
+  return line || "your property";
+}
+
+function buildSpokenLocationClause(streetName, cityRaw, stateRaw) {
+  const street = String(streetName || "").trim() || "your property";
+  const city = String(cityRaw || "").trim();
+  const stateSpoken = expandUsStateForSpeech(stateRaw);
+
+  if (city && stateSpoken) return `${street} in ${city}, ${stateSpoken}`;
+  if (city) return `${street} in ${city}`;
+  if (stateSpoken) return `${street} in ${stateSpoken}`;
+  return street;
+}
+
+/** Precomputed strings for the opener + session (Realtime-safe, no SSML). */
+function buildOpenerSpeechContext(lead) {
+  const rawAddress =
+    lead.address || lead["Property Address"] || lead.streetAddress || "";
+
+  const sellerName = formatSellerFirstName(lead.first_name);
+  const streetName = extractStreetLineForSpeech(rawAddress);
+  const city = String(lead.city || "").trim();
+  const fullStateName = expandUsStateForSpeech(lead.state);
+  const locationClause = buildSpokenLocationClause(streetName, city, lead.state);
+
+  const sessionRules = [
+    `Opener location (use this exact spoken form for the opening question, and keep house numbers and ZIP codes out of speech): "${locationClause}".`,
+    `Always pronounce the U.S. state as full words in this call${
+      fullStateName ? ` (say "${fullStateName}")` : ""
+    }. Never read a state as separate letters (never "F L", "O H", or "T X").`,
+  ].join(" ");
+
+  return {
+    sellerName,
+    streetName,
+    city,
+    fullStateName,
+    locationClause,
+    sessionRules,
+  };
+}
+
+/** Mandatory first lines (session + response.create). Server fills name/location only. */
+function buildFixedOutboundOpenerScript(ctx) {
+  const hi = `Hi ${ctx.sellerName}?`;
+  const ask = `This is Daniel - Would you potentially be open to selling your property on ${ctx.locationClause}?`;
+  return { hi, ask };
+}
+
+function buildOutboundOpenerInstructionBlock(ctx) {
+  const { hi, ask } = buildFixedOutboundOpenerScript(ctx);
+  return [
+    "OPENING SCRIPT — first audio after connect (non-negotiable)",
+    "",
+    "Deliver exactly two spoken parts in order, with natural tone but verbatim wording:",
+    `1) Say exactly: ${hi}`,
+    `2) Say exactly: ${ask}`,
+    "",
+    "Do not add any words before step 1. Do not add small talk between steps 1 and 3.",
+    "Do not change the location phrase; it must match the session wording character-for-character (aside from normal capitalization in speech).",
+    "",
+    ctx.sessionRules,
+    "",
+    "After the prospect answers this opening, treat the rest of the call as a normal conversation (the fixed-script rule no longer applies).",
+  ].join("\n");
+}
+
+function buildOpenerResponseCreateInstructions(ctx) {
+const { hi, ask } = buildFixedOutboundOpenerScript(ctx);
+
+return [
+"IMPORTANT — STRICT DELIVERY MODE",
+"",
+"For the FIRST spoken response ONLY:",
+"",
+"You MUST say the OPENING SCRIPT exactly as written.",
+"",
+"",
+"Treat the opener like a strict verbal readout.",
+"",
+"OPENING SCRIPT:",
+"",
+`1) Say exactly: ${hi}`,
+"",
+"",
+`2) Then say exactly: ${ask}`,
+"",
+"",
+"Once the seller responds:",
+"STRICT DELIVERY MODE ENDS.",
+"Return to normal conversational behavior.",
+].join("\n");
+}
+
+
 const SYSTEM_PROMPT = `
+# 1. RULES
+
 You are Daniel, a real estate investor calling property owners.
 
 Speak like a real operator — calm, direct, controlled, and natural.
 
-Do NOT sound scripted.
-Do NOT overtalk.
-Do NOT explain things in detail.
-Do NOT rush your speech.
-
 Use short sentences.
-Use natural pauses.
 Let the seller speak.
 
---------------------------------------------------
-
-PRIMARY GOAL
-
-Guide the seller to:
-- openness to selling
-- share condition, timeline, and price
-- feel understood and not pressured
-
-You are not pitching.
-You are diagnosing and guiding.
-
---------------------------------------------------
+---
 
 LANGUAGE RULE
 
-You must speak ONLY in English.
-Do NOT switch languages under any circumstance.
+Speak ONLY in English. UNLESS ASKED / and OTHER LANGUAGE IDENTIFIED /
 
---------------------------------------------------
+---
 
-TONE + DELIVERY RULES
+TONE + DELIVERY
 
-- Slightly curious tone at the start
-- Slow down when seller shares anything personal
-- Match their energy (short vs talkative)
-- Use light, natural fillers occasionally (“yeah…”, “got it…”)
-- NEVER stack questions
-- ALWAYS pause after key lines (~1–2 seconds)
-- Avoid monotone delivery
+* Match the seller’s energy
+* Slow down if seller shares something meaningful
+* Never stack questions
+* Keep the conversation natural and conversational
+* Listen carefully before responding
+* Do not paraphrase every seller response
+* Keep acknowledgements brief and natural
 
-----------------------------------
+---
 
-ENERGY + PERSONALITY LAYER
+CONVERSATION CONTROL
 
-You bring slightly more positive energy into the conversation.
+If seller goes off topic:
 
-- Your tone has light enthusiasm
-- You sound engaged, not flat
-- You have subtle personality in your voice
-- You are pleasant and easy to talk to
+* briefly acknowledge it
+* then naturally redirect back to the property
 
-Do NOT sound overly excited.
-Do NOT sound like a salesperson.
-Do NOT force energy.
-
-Your energy level is:
-- +20% more positive than neutral
-- calm but upbeat
-- confident but relaxed
-
-Slightly smile in your voice when speaking.
-
---------------------------------------------------
-
-HUMAN CONNECTION LAYER (CRITICAL)
-
-Before asking a new question:
-
-1. Acknowledge what they said
-2. Reflect it back simply
-3. Then move forward
-
-Do NOT jump straight into the next question.
-
-The seller must feel understood before they will give real answers.
-
---------------------------------------------------
-
-EMOTIONAL PRIORITY RULE (CRITICAL)
-
-If the seller shares anything personal, emotional, or situational:
-
-- STOP progressing the script
-- Acknowledge it
-- Validate it
-- Stay in that moment briefly
-
-Do NOT say:
-“let’s bring it back”
-“anyway”
-“so…”
-
-Do NOT redirect immediately.
-
-Only continue after the seller feels understood.
-
---------------------------------------------------
-
-CALL FLOW (FOLLOW NATURALLY, NOT ROBOTICALLY)
-
-OPEN
-
-Hey (Name)?
-
-
-This is Daniel.
-
-
-I was calling about your place on (Street in City)…
-
-
-Would you potentially be open to selling?
-
---------------------------------------------------
-
-IF SELLER IS OPEN
-
-Got it…
-[pause]
-
-Help me understand the property a bit—
-
---------------------------------------------------
-
-IF SELLER SAYS NO / PUSHBACK
-
-Got it…
-[pause]
-
-Sounds like you’re not really looking right now?
-[pause]
-
-I mean—if someone came in with a million-dollar offer… you’d at least take a look, right?
-[pause]
-
-Once they agree:
-
-Right—so there is a number that would make sense
-[pause]
-
-That’s all I’m trying to figure out
-[pause]
-
-Give me like 30 seconds—let me just understand the property real quick
-
---------------------------------------------------
-
-PROPERTY INFO (NO PRIOR DATA)
-
-Remind me—how many beds and baths is it?
-[pause]
-
-Square footage?
-[pause]
-
-Got it—so (repeat back beds/baths/sqft briefly)
-
---------------------------------------------------
-
-CONDITION
-
-And how’s the condition overall?
-[pause]
-
-Give me the reality of it—
-[pause]
-
-million-dollar listing is a 10, full teardown is a 1… where does it sit?
-
---------------------------------------------------
-
-PROPERTY USE
-
-Was that something you ever rented out, or was it more just yours?
-
---------------------------------------------------
-
-MOTIVATION
-
-Got it…
-[pause]
-
-In a perfect world, whats your ideal scenario with this property?
-
---------------------------------------------------
-
-RESPONSE LOOP (USE ONLY WHEN MEANINGFUL)
-
-When seller shares something important:
-
-Yeah…
-So it’s more about (summarize their situation)…
-That makes sense
-
-Then continue naturally.
-
---------------------------------------------------
-
-TIMELINE
-
-If everything lined up… whats your ideal timeframe in regards to closing?
-
-If unclear:
-Is that more like 30 days, or closer to a couple months?
-
---------------------------------------------------
-
-PRICE
-
-Do you have a number in mind where it would make sense for you?
-
-If hesitant:
-Doesn’t have to be exact—just ballpark
-
-If high:
-Got it—I hear you. Just trying to understand where you’re at
-
---------------------------------------------------
-
-POSITIONING (NON-SALESY)
-
-Yeah—usually when I do these, I just keep it straightforward…
-
---------------------------------------------------
-
-SOFT CLOSE
-
-What I can do is take a look at it and see what actually makes sense
-If it lines up, we can go from there—fair?
-
---------------------------------------------------
-
-EXIT
-
-Alright—I’ll take a look and get back to you
-Appreciate you sharing that
-
---------------------------------------------------
+---
 
 CRITICAL RULES
 
-- NEVER say “in regards to”
-- NEVER say “confirm” or “verify”
-- NEVER sound like a script
-- NEVER argue with the seller
-- NEVER push hard on price early
+* NEVER say “in regards to”
+* NEVER say “confirm” or “verify”
+* NEVER sound like a script
+* NEVER argue with the seller
+* NEVER push hard on price early
+* NEVER sound overly excited
+* NEVER sound robotic
+* NEVER interrogate the seller
 
---------------------------------------------------
-
-CONVERSATION CONTROL RULES
-
-- Guide, don’t force
-- If seller goes off topic → acknowledge, then gently bring back
-- Do NOT say “let’s bring it back”
-- Instead:
-  “Yeah I hear you…” → then redirect with a question
-
---------------------------------------------------
-
-FINAL OPERATING MODE
-
-You operate using:
-
-- tonality (calm, controlled, natural delivery)
-- understanding (you listen and reflect before moving forward)
-- empathy (the seller feels heard and respected)
-- subtle psychology (you guide the conversation without pressure)
-
-You are not trying to convince.
-
-You are creating an environment where the seller:
-- opens up
-- feels comfortable
-- shares real information
-
---------------------------------------------------
-
-SELLER EXPERIENCE TARGET
-
-The seller should feel:
-
-- “this guy actually gets it”
-- “he’s not pushing me”
-- “this feels easy to talk through”
-
-Not:
-- pressured
-- rushed
-- sold
-
---------------------------------------------------
+---
 
 YOUR ROLE
 
 You are:
 
-- calm under control
-- slightly curious
-- easy to talk to
-- leading without force
+* calm under control
+* slightly curious
+* easy to talk to
+* leading without force
 
 You are NOT:
 
-- aggressive
-- robotic
-- overly friendly
-- overly analytical
+* aggressive
+* robotic
+* overly friendly
+* overly analytical
 
---------------------------------------------------
+==================================================
 
-CORE EXECUTION TRUTH
+# 2. SCRIPT / CALL FLOW
 
-The deal does not come from:
-- the script
-- the questions
+==================================================
 
-It comes from:
-- how the seller feels while talking to you
+IF SELLER PUSHES BACK / SAYS NO
 
-If they feel understood → they give real answers
-If they feel pressure → they shut down
+Goal:
+
+* soften resistance
+* keep conversation alive
+* uncover flexibility
+
+Example:
+
+“Sounds like you’re probably not looking right now.”
+
+“If someone came in with the right number though…
+you’d at least take a look, right?”
+
+“Right — so there is a number that would make sense.”
+
+“That’s all I’m trying to figure out.”
+
+“Give me like 30 seconds — let me just understand the property real quick.”
+
+---
+
+PROPERTY INFO
+
+Goal:
+
+* determine occupancy and basic situation
+
+Examples:
+
+“Are you living there now or is it rented out?”
+
+If vacant:
+
+* subtly mention holding costs
+* then continue naturally
+
+---
+
+CONDITION
+
+Goal:
+
+* understand overall condition
+* determine level of updating/work needed
+
+Examples:
+
+“How’s the condition overall?”
+
+“How updated is it?”
+
+“Does it need much work?”
+
+---
+
+MOTIVATION
+
+Goal:
+
+* understand why they would sell
+* uncover situation behind the sale
+
+Examples:
+
+“What would ideally happen with the property?”
+
+“What’s the situation with it right now?”
+
+---
+
+TIMELINE
+
+Goal:
+
+* understand urgency and flexibility
+
+Examples:
+
+“If everything made sense - how soon would you want to move on it?”
+
+If unclear:
+
+“Are you thinking more like 30 days… or more a couple months?”
+
+---
+
+PRICE
+
+Goal:
+
+* uncover expectation without pressure
+
+Examples:
+
+“Do you have a number in mind - where you’d seriously consider selling?”
+
+Backup:
+
+“Just trying to understand where you’re at.”
+
+---
+
+POSITIONING
+
+Goal:
+
+* keep interaction low-pressure and straightforward
+
+Examples:
+
+“I honestly dont like to beat around the bush”
+
+“I’m really just trying to understand whether something makes sense for both sides.”
+
+---
+
+SOFT CLOSE
+
+Goal:
+
+* exit naturally
+* preserve follow-up opportunity
+
+Examples:
+
+“What I can do is take a look at everything and see what actually makes sense.”
+
+“If it lines up, I’ll give you a call back and we can go from there.”
+
+---
+
+EXIT
+
+Examples:
+
+“I’ll take a look and get back to you.”
+
+“Appreciate you taking the time.”
+
 `;
+
+const MACHINE_PHRASES = [
+
+  "leave a message",
+  "your call has been forwarded",
+  "voice mailbox",
+  "mailbox is full",
+  "at the tone",
+  "record your message",
+  "google voice subscriber",
+  "not available",
+
+  "press 1",
+  "press one",
+  "press 2",
+  "for english",
+  "main menu",
+  "choose an option",
+  "please select",
+  "invalid selection",
+  "using your keypad",
+  "say or press",
+  "operator",
+  "extension",
+
+  "please continue",
+  "please repeat",
+  "i didn't get that",
+  "cannot process",
+];
+
+function detectMachineTranscript(text = "") {
+
+  const lower = text.toLowerCase();
+
+  return MACHINE_PHRASES.some(phrase =>
+    lower.includes(phrase)
+  );
+}
 
 
 function getPublicBaseUrl(req) {
@@ -411,7 +562,13 @@ app.all("/voice", (req, res) => {
 
 async function updateGHL(outcome, summary, phoneOverride) {
   try {
-    const response = await fetch("https://services.leadconnectorhq.com/contacts/upsert", {
+    const upsertUrl = buildGhlContactsUpsertUrl(phoneOverride);
+    if (!upsertUrl) {
+      console.warn("GHL UPDATE SKIPPED: missing phone/email identifier for upsert");
+      return;
+    }
+
+    const response = await fetch(upsertUrl, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.GHL_API_KEY}`,
@@ -455,8 +612,7 @@ console.log("CALL DURATION USED:", callDuration);
 if (
   callStatus === "no-answer" ||
   callStatus === "busy" ||
-  callStatus === "failed" ||
-  (callStatus === "completed" && callDuration <= 15)
+  callStatus === "failed"
 ) {
   console.log("TRIGGERING GHL UPDATE FOR NO ANSWER");
 
@@ -474,18 +630,81 @@ if (
   }
 });
 
+app.post("/amd-status", (req, res) => {
 
-app.post("/recording", (req, res) => {
-  const recordingUrl = req.body.RecordingUrl + ".mp3";
-
-  console.log("Recording ready:", recordingUrl);
-  console.log("Call SID:", req.body.CallSid);
+  console.log("AMD STATUS:", req.body);
 
   res.sendStatus(200);
 });
 
+app.post("/recording", async (req, res) => {
+  const callSid = req.body.CallSid;
+
+  try {
+    const recordingUrl = req.body.RecordingUrl + ".mp3";
+
+    const phone =
+      (callSid && callSidToLeadPhone.get(callSid)) ||
+      req.body.To ||
+      req.body.Called ||
+      req.body.Caller ||
+      req.body.From ||
+      currentCallLead.phone;
+
+    console.log("Recording ready:", recordingUrl);
+    console.log("Call SID:", callSid);
+    console.log("PHONE:", phone);
+
+    const upsertUrl = buildGhlContactsUpsertUrl(phone);
+    if (!upsertUrl) {
+      console.warn(
+        "GHL RECORDING UPDATE SKIPPED: no phone/email (recording callbacks often omit To/Called; ensure CallSid was registered at dial)"
+      );
+      return res.sendStatus(200);
+    }
+
+    const response = await fetch(upsertUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.GHL_API_KEY}`,
+        Version: "2021-07-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        locationId: process.env.GHL_LOCATION_ID,
+        phone: phone,
+
+        customFields: [
+          {
+            key: "twilio_call_sid",
+            field_value: callSid,
+          },
+          {
+            key: "twilio_recording_url",
+            field_value: recordingUrl,
+          },
+        ],
+      }),
+    });
+
+    const data = await response.json();
+
+    console.log("GHL RECORDING UPDATE:", JSON.stringify(data, null, 2));
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("RECORDING ERROR:", err);
+    res.sendStatus(500);
+  } finally {
+    if (callSid) callSidToLeadPhone.delete(callSid);
+  }
+});
+
 app.post("/start-call", async (req, res) => {
   try {
+
+    console.log( "RAW GHL BODY:", JSON.stringify(req.body, null, 2) );
+    
     const {
       first_name,
       last_name,
@@ -552,6 +771,11 @@ app.post("/start-call", async (req, res) => {
   to: cleanPhone,
   from: process.env.TWILIO_PHONE_NUMBER,
   url: `${publicBaseUrl}/voice`,
+      
+      machineDetection: "DetectMessageEnd",
+asyncAmd: true,
+asyncAmdStatusCallback: `${publicBaseUrl}/amd-status`,
+      
   statusCallback: `${publicBaseUrl}/call-status`,
   statusCallbackEvent: ["completed", "no-answer", "busy",  "failed"],
   record: true,
@@ -559,6 +783,8 @@ app.post("/start-call", async (req, res) => {
   recordingStatusCallback: `${publicBaseUrl}/recording`,
   recordingStatusCallbackEvent: ["completed"],
 });
+
+    callSidToLeadPhone.set(call.sid, cleanPhone);
 
     console.log("OUTBOUND CALL STARTED:", call.sid);
 
@@ -579,56 +805,39 @@ app.post("/start-call", async (req, res) => {
 wss.on("connection", (twilioWs) => {
   console.log("Twilio websocket connected");
 
-
-
-function normalizeAddressForSpeech(address) {
-  if (!address) return "";
-
-  return address
-    .replace(/\bDr\b/gi, "Drive")
-    .replace(/\bRd\b/gi, "Road")
-    .replace(/\bSt\b/gi, "Street")
-    .replace(/\bAve\b/gi, "Avenue")
-    .replace(/\bBlvd\b/gi, "Boulevard")
-    .replace(/\bLn\b/gi, "Lane")
-    .replace(/\bCt\b/gi, "Court")
-    .replace(/\bPl\b/gi, "Place")
-    .replace(/\bTer\b/gi, "Terrace");
-}
+  const openerSpeech = buildOpenerSpeechContext(currentCallLead);
+  console.log("SPOKEN OPENER CONTEXT:", openerSpeech);
 
   let streamSid = null;
   let callSid = null;
   let latestMediaTimestamp = 0;
   let responseStartTimestamp = null;
   let lastAssistantItem = null;
-  let assistantTranscript = "";
   let fullCallTranscript = "";
-  let callEndingScheduled = false;
-  let leadFirst_name = currentCallLead.first_name || "there";
-  let leadAddress = normalizeAddressForSpeech(
-  (currentCallLead.address || "your property")
-    .replace(/^\d+\s*/, "")
-    .replace(/\d{5}(-\d{4})?$/, "")
-    .split(",")[0]
-    .trim()
-);
-
-if (currentCallLead.city) {
-  leadAddress += ` in ${currentCallLead.city}`;
-}
-  let leadCity = currentCallLead.city || "";
-  
-
+  let callState = CALL_STATE.IDLE;
+  /** Post-opener seller lines appended to fullTranscript for classification. */
+  let sellerEngagedPostOpener = false;
+  /** Any completed seller transcription (legacy sellerSpoke semantics for CRM). */
+  let sellerUtteranceDetected = false;
+  let hangupTaskScheduled = false;
+  /** True from `response.create` for the opener until `response.done` for that response. */
+  let openerInProgress = false;
+  let sellerAudioEnabled = false;
+  let machineScore = 0;
+  /** Twilio often sends `start` after OpenAI already streams opener audio — buffer until `streamSid` exists. */
+  const pendingTwilioMediaPayloads = [];
+  const MAX_PENDING_MEDIA_CHUNKS = 4000;
+  let openerResponseSent = false;
+  let openerFallbackTimer = null;
 
   const openAiWs = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-realtime",
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    }
-  );
+  "wss://api.openai.com/v1/realtime?model=gpt-realtime-2",
+  {
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+  }
+);
 
  function shouldEndCall(text) {
   const t = String(text || "").toLowerCase();
@@ -752,44 +961,36 @@ If uncertain, choose follow_up.
 }
 
 function scheduleEndCall(reason) {
-  if (callEndingScheduled) return;
-  callEndingScheduled = true;
+  if (hangupTaskScheduled || callState === CALL_STATE.ENDED) return;
+  hangupTaskScheduled = true;
+
+  if (
+    callState !== CALL_STATE.VOICEMAIL &&
+    callState !== CALL_STATE.WRONG_NUMBER
+  ) {
+    callState = CALL_STATE.ENDING;
+  }
 
   console.log("AUTO ENDING CALL:", reason);
-
- classifyCall(fullTranscript).then((result) => {
-updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
-  });
 
   setTimeout(async () => {
     try {
       if (callSid) {
         console.log("FORCE END CALL:", callSid);
 
-        await twilioClient.calls(callSid).update({
-          status: "completed",
-        });
+        twilioClient.calls(callSid).update({
+  status: "completed"
+});
       }
     } catch (err) {
-      console.error("TWILIO END ERROR:", err);
+      console.error("FORCE END CALL ERROR:", err);
     }
-
-    try {
-      if (twilioWs.readyState === WebSocket.OPEN) {
-        twilioWs.close();
-      }
-    } catch (err) {}
-
-    try {
-      if (openAiWs.readyState === WebSocket.OPEN) {
-        openAiWs.close();
-      }
-    } catch (err) {}
-
-  }, 4000); // shorter = cleaner
+  }, 1500);
 }
 
  async function sendSessionUpdate() {
+  const openerBlock = buildOutboundOpenerInstructionBlock(openerSpeech);
+
   const leadContext = `
 CURRENT LEAD CONTEXT:
 
@@ -811,45 +1012,66 @@ Call Notes: ${currentCallLead.callNotes || ""}
 Use this as background context.
 Do NOT read all details out loud.
 Mention the property address naturally.
-Do not sound creepy or like you're reading from a database.
-Use the data only to guide better questions.
 `;
 
   console.log("CALL LEAD LOADED FROM GHL:", currentCallLead);
 
-  const sessionUpdate = {
-    type: "session.update",
-    session: {
+ const sessionUpdate = {
+  type: "session.update",
+  session: {
+  type: "realtime",
+  output_modalities: ["audio"],
+
+  instructions:
+    openerBlock +
+    `
+
+` +
+    SYSTEM_PROMPT +
+    `
+` +
+    leadContext,
+
+  audio: {
+    input: {
+      format: {
+        type: "audio/pcmu"
+      },
+
       turn_detection: {
         type: "server_vad",
-        threshold: 0.97,
-        prefix_padding_ms: 700,
-        silence_duration_ms: 1050,
+        threshold: 0.76,
+        prefix_padding_ms: 850,
+        silence_duration_ms: 650,
+        /** We drive the opener with an explicit `response.create`; VAD-only auto replies can starve the opener. */
+        create_response: false,
+        interrupt_response: true,
+      }
+    },
+
+    output: {
+      format: {
+        type: "audio/pcmu"
       },
-      input_audio_format: "g711_ulaw",
-      input_audio_transcription: {
-      model: "gpt-4o-mini-transcribe",
-    },
 
-      instructions: SYSTEM_PROMPT + `
+      voice: "cedar"
+    }
+  }
+  }
+};
+   
+console.log(
+  "SESSION UPDATE SENT:",
+  JSON.stringify(sessionUpdate, null, 2)
+);
 
-CRITICAL EXECUTION RULE:
-
-- LESS is MORE, direct sentences
-- Follow the call flow tightly
-- One question at a time
-If a sentence can be shorter, make it shorter. 
-
-` + leadContext,
-      modalities: ["text"],
-      temperature: 0.60,
-    },
-  };
-
+   
   openAiWs.send(JSON.stringify(sessionUpdate));
 }
 
   function clearTwilioAudio() {
+    pendingTwilioMediaPayloads.length = 0;
+
     if (!streamSid) return;
 
     twilioWs.send(
@@ -860,135 +1082,147 @@ If a sentence can be shorter, make it shorter.
     );
   }
 
-  function interruptAssistant() {
-    if (!lastAssistantItem || responseStartTimestamp === null) return;
+  function flushPendingAssistantAudioToTwilio() {
+    if (!streamSid || pendingTwilioMediaPayloads.length === 0) return;
 
-    const elapsedMs = latestMediaTimestamp - responseStartTimestamp;
+    console.log(
+      `TWILIO FLUSH: replaying ${pendingTwilioMediaPayloads.length} buffered assistant audio frame(s)`
+    );
+
+    while (pendingTwilioMediaPayloads.length) {
+      const payload = pendingTwilioMediaPayloads.shift();
+      twilioWs.send(
+        JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload },
+        })
+      );
+    }
+  }
+
+  function forwardAssistantAudioToTwilio(delta) {
+    if (!delta) return;
+
+    if (streamSid) {
+      twilioWs.send(
+        JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: delta },
+        })
+      );
+      return;
+    }
+
+    if (pendingTwilioMediaPayloads.length === 0) {
+      console.log(
+        "TWILIO BUFFER: assistant audio arrived before stream start — buffering until streamSid"
+      );
+    }
+
+    if (pendingTwilioMediaPayloads.length >= MAX_PENDING_MEDIA_CHUNKS) {
+      console.error("TWILIO BUFFER: cap exceeded; dropping assistant audio chunk");
+      return;
+    }
+
+    pendingTwilioMediaPayloads.push(delta);
+  }
+
+  function sendOpenerResponseOnce(source) {
+    if (openerResponseSent) return;
+    if (openAiWs.readyState !== WebSocket.OPEN) return;
+
+    openerResponseSent = true;
+
+    if (openerFallbackTimer) {
+      clearTimeout(openerFallbackTimer);
+      openerFallbackTimer = null;
+    }
+
+    console.log("OPENER response.create →", source);
+
+    openerInProgress = true;
 
     openAiWs.send(
       JSON.stringify({
-        type: "conversation.item.truncate",
-        item_id: lastAssistantItem,
-        content_index: 0,
-        audio_end_ms: elapsedMs,
+        type: "response.create",
+        response: {
+          instructions: buildOpenerResponseCreateInstructions(openerSpeech),
+        },
       })
     );
-
-    clearTwilioAudio();
-
-    lastAssistantItem = null;
-    responseStartTimestamp = null;
   }
+
+ function interruptAssistant() {
+
+  if (!lastAssistantItem || responseStartTimestamp === null) return;
+
+  callState = CALL_STATE.INTERRUPTING;
+
+  const elapsedMs = latestMediaTimestamp - responseStartTimestamp;
+
+  openAiWs.send(
+    JSON.stringify({
+      type: "conversation.item.truncate",
+      item_id: lastAssistantItem,
+      content_index: 0,
+      audio_end_ms: elapsedMs,
+    })
+  );
+
+  clearTwilioAudio();
+
+  lastAssistantItem = null;
+  responseStartTimestamp = null;
+}
 
 openAiWs.on("open", async () => {
   console.log("Connected to OpenAI Realtime");
 
+  callState = CALL_STATE.OPENING;
+
+  
   await sendSessionUpdate();
 
-  openAiWs.send(
-    JSON.stringify({
-      type: "response.create",
-      response: {
-        modalities: ["text"],
-        instructions: `
-Say exactly this. No extra words. No filler. No hesitation.
+  setTimeout(() => {
+    sendOpenerResponseOnce("post_session_update_tick");
+  }, 200);
 
-Do NOT say "uh", "um", or any filler.
+  openerFallbackTimer = setTimeout(() => {
+    openerFallbackTimer = null;
+    sendOpenerResponseOnce("fallback_opener");
+  }, 1600);
+  });
 
-Speak clean, direct, and confident.
-
-Opening:
-
-Hey ${leadFirst_name}?
-
-.....
-
-This is Daniel.
-
-I'm calling in regards to ${leadAddress} - Would you potentially be open to selling?
-
-`
-      },
-    })
-  );
-});
-
-async function speakWithElevenLabs(text) {
-  try {
-    console.log("ELEVEN START:", text);
-
-    if (!text) {
-      console.log("ELEVEN STOP: no text");
-      return;
-    }
-
-    if (!streamSid) {
-      console.log("ELEVEN STOP: no streamSid");
-      return;
-    }
-
-    const voiceId = process.env.ELEVENLABS_VOICE_ID;
-
-    const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": process.env.ELEVENLABS_API_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          text,
-          model_id: "eleven_flash_v2_5",
-          voice_settings: {
-            stability: 0.35,
-            similarity_boost: 0.85,
-            style: 0.35,
-            use_speaker_boost: true,
-          },
-        }),
-      }
-    );
-
-    console.log("ELEVEN STATUS:", response.status);
-
-    if (!response.ok) {
-      console.error("ELEVEN ERROR:", await response.text());
-      return;
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    console.log("ELEVEN AUDIO BYTES:", arrayBuffer.byteLength);
-
-    const base64Audio = Buffer.from(arrayBuffer).toString("base64");
-
-    twilioWs.send(
-      JSON.stringify({
-        event: "media",
-        streamSid,
-        media: {
-          payload: base64Audio,
-        },
-      })
-    );
-
-    console.log("ELEVEN SENT TO TWILIO");
-  } catch (err) {
-    console.error("ELEVEN FUNCTION ERROR:", err);
-  }
-}
-// ✅ THEN this
-let assistantText = "";
-let fullTranscript = "";
-let sellerSpoke = false;
-
-// ✅ THEN your OpenAI handler
-
+let fullTranscript = ""; 
 
 openAiWs.on("message", (data) => {
   try {
     const event = JSON.parse(data.toString());
     console.log("OPENAI EVENT:", event.type);
+
+    if (event.type === "response.output_audio.delta") {
+
+  console.log("AUDIO DELTA RECEIVED");
+
+  if (event.item_id) {
+    lastAssistantItem = event.item_id;
+  }
+
+  if (
+    callState === CALL_STATE.LISTENING ||
+    callState === CALL_STATE.INTERRUPTING
+  ) {
+    callState = CALL_STATE.RESPONDING;
+  }
+
+  if (!responseStartTimestamp) {
+    responseStartTimestamp = latestMediaTimestamp;
+  }
+
+  forwardAssistantAudioToTwilio(event.delta);
+}
 
     if (event.type === "conversation.item.created") {
       const item = event.item;
@@ -1003,55 +1237,212 @@ openAiWs.on("message", (data) => {
       }
     }
 
-
 if (event.type === "conversation.item.input_audio_transcription.completed") {
-  sellerSpoke = true;
-  fullTranscript += `\nSeller: ${event.transcript}`;
-  console.log("SELLER SAID:", event.transcript);
-}
 
-    // collect AI streaming text
-    if (event.type === "response.text.delta" && event.delta) {
-      assistantText += event.delta;
+  sellerUtteranceDetected = true;
+
+  const transcript = (event.transcript || "").trim();
+  const lowerTranscript = transcript.toLowerCase();
+
+  if (detectMachineTranscript(lowerTranscript)) {
+
+    machineScore += 3;
+
+    console.log("MACHINE PHRASE DETECTED");
+  }
+
+  if (transcript.length > 200) {
+
+    machineScore += 1;
+  }
+
+  console.log("MACHINE SCORE:", machineScore);
+
+  if (machineScore >= 4) {
+
+    console.log("VOICEMAIL / IVR DETECTED");
+
+    callState = CALL_STATE.VOICEMAIL;
+
+    openerInProgress = false;
+
+    fullTranscript += `\nVOICEMAIL: ${transcript}`;
+    fullCallTranscript += `VOICEMAIL: ${transcript}\n`;
+
+    interruptAssistant();
+
+    openAiWs.send(JSON.stringify({
+      type: "response.cancel"
+    }));
+
+    clearTwilioAudio();
+
+    try {
+
+      twilioClient.calls(callSid).update({
+        status: "completed"
+      });
+
+      console.log("VOICEMAIL CALL ENDED");
+
+    } catch (err) {
+
+      console.error("FAILED TO END VOICEMAIL CALL:", err);
+
     }
 
-// full message finished
-if (event.type === "response.text.done") {
-  console.log("AI SAID:", assistantText);
+    return;
+  }
+
+  // rest of your existing logic below
+
+console.log("SELLER SAID:", transcript);
 
 
-  fullTranscript += `\nAI: ${assistantText}`;
-  fullCallTranscript += `AI: ${assistantText}\n`;
 
-  speakWithElevenLabs(assistantText);
 
-console.log("CHECKING END CALL:", assistantText);
+  // WRONG NUMBER DETECTION
+  // =========================
 
-if (shouldEndCall(assistantText)) {
-  console.log("END CALL TRIGGERED"); // 👈 add this
-  scheduleEndCall(assistantText);
-}
+  const wrongNumberPhrases = [
+    "wrong number",
+    "you have the wrong number",
+    "wrong person",
+    "not the right number",
+    "you called the wrong number",
+    "doesn't live here",
+    "does not live here",
+    "not this person",
+    "you got the wrong person"
+  ];
 
-  assistantText = "";
-}
+  const isWrongNumber = wrongNumberPhrases.some(phrase =>
+    lowerTranscript.includes(phrase)
+  );
 
-    // user starts speaking → stop any current playback
+  if (isWrongNumber) {
+    console.log("WRONG NUMBER DETECTED");
+
+    callState = CALL_STATE.WRONG_NUMBER;
+    openerInProgress = false;
+
+    fullTranscript += `\nWRONG NUMBER: ${transcript}`;
+    fullCallTranscript += `WRONG NUMBER: ${transcript}\n`;
+
+    updateGHL(
+      "ai_wrong_number",
+      "Contact stated this is a wrong number.",
+      currentCallLead.phone
+    );
+
+    clearTwilioAudio();
+
+    scheduleEndCall("wrong number");
+
+    return;
+  }
+  
+  // =========================
+  // NORMAL HUMAN SPEECH (only after opener — realtime mode)
+  // =========================
+
+  const realtimeConversation =
+    callState === CALL_STATE.LISTENING ||
+    callState === CALL_STATE.RESPONDING ||
+    callState === CALL_STATE.INTERRUPTING;
+
+  if (!realtimeConversation) {
+    console.log("SELLER SPEECH DURING OPENER — deferred until LISTENING");
+    fullCallTranscript += `SELLER (during opener): ${transcript}\n`;
+    return;
+  }
+
+  sellerEngagedPostOpener = true;
+
+ fullTranscript += `\nSeller: ${transcript}`;
+fullCallTranscript += `SELLER: ${transcript}\n`;
+
+  }
+
+
+    // user starts speaking → stop any current playback (realtime mode only)
 if (event.type === "input_audio_buffer.speech_started") {
   console.log("Possible user speech detected");
 
- interruptAssistant();
+  const canInterrupt =
+    callState === CALL_STATE.LISTENING ||
+    callState === CALL_STATE.RESPONDING;
+
+  if (!canInterrupt) {
+    console.log("Ignoring speech_started during opener/startup");
+    return;
+  }
+
+  interruptAssistant();
 
   setTimeout(() => {
     clearTwilioAudio();
+    if (callState === CALL_STATE.INTERRUPTING) {
+      callState = CALL_STATE.LISTENING;
+    }
   }, 450);
 }
 
+    if (event.type === "input_audio_buffer.speech_stopped") {
+      if (
+        callState === CALL_STATE.VOICEMAIL ||
+        callState === CALL_STATE.WRONG_NUMBER ||
+        callState === CALL_STATE.ENDING ||
+        callState === CALL_STATE.ENDED
+      ) {
+        return;
+      }
+
+      if (callState === CALL_STATE.OPENING) {
+        return;
+      }
+
+      if (
+        callState === CALL_STATE.RESPONDING ||
+        callState === CALL_STATE.INTERRUPTING
+      ) {
+        return;
+      }
+
+      if (openAiWs.readyState !== WebSocket.OPEN) return;
+
+      console.log("SPEECH STOPPED → response.create (manual reply turn)");
+
+      openAiWs.send(
+        JSON.stringify({
+          type: "response.create",
+        })
+      );
+    }
+
+
     // safety: end-call checks
     if (event.type === "response.done") {
+      if (openerInProgress) {
+        openerInProgress = false;
+
+        if (callState === CALL_STATE.OPENING) {
+          callState = CALL_STATE.LISTENING;
+          console.log("OPENER ACTUALLY FINISHED → LISTENING");
+        }
+      }
+
       const text = JSON.stringify(event);
 
       if (shouldEndCall(text)) {
         scheduleEndCall(text);
+      }
+
+      if (
+        callState === CALL_STATE.RESPONDING ||
+        callState === CALL_STATE.INTERRUPTING
+      ) {
+        callState = CALL_STATE.LISTENING;
       }
 
       responseStartTimestamp = null;
@@ -1059,7 +1450,7 @@ if (event.type === "input_audio_buffer.speech_started") {
     }
 
     if (event.type === "error") {
-      console.error("OpenAI realtime error:", event);
+      console.error("OpenAI realtime error:", event.error || event);
     }
   } catch (err) {
     console.error("OpenAI message parse error:", err);
@@ -1071,33 +1462,52 @@ if (event.type === "input_audio_buffer.speech_started") {
       const msg = JSON.parse(raw.toString());
 
       if (msg.event === "start") {
+          machineScore = 0;
+
         streamSid = msg.start.streamSid;
         callSid = msg.start.callSid;
+
+        sellerAudioEnabled = false;
+
+setTimeout(() => {
+
+  sellerAudioEnabled = true;
+
+  console.log("SELLER AUDIO ENABLED");
+
+}, 8250);
 
         console.log("Twilio stream started:", {
           streamSid,
           callSid,
         });
 
-     
+        flushPendingAssistantAudioToTwilio();
 
         return;
       }
 
-      if (msg.event === "media") {
-        latestMediaTimestamp = msg.media.timestamp;
+   if (msg.event === "media") {
 
-        if (openAiWs.readyState === WebSocket.OPEN) {
-          openAiWs.send(
-            JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: msg.media.payload,
-            })
-          );
-        }
+  latestMediaTimestamp = msg.media.timestamp;
 
-        return;
-      }
+  // Ignore seller audio during opener
+  if (!sellerAudioEnabled) {
+    return;
+  }
+
+  if (openAiWs.readyState === WebSocket.OPEN) {
+
+    openAiWs.send(
+      JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: msg.media.payload,
+      })
+    );
+  }
+
+  return;
+}
 
      if (msg.event === "stop") {
   console.log("Twilio stream stopped:", {
@@ -1105,7 +1515,17 @@ if (event.type === "input_audio_buffer.speech_started") {
     callSid,
   });
 
+  openerInProgress = false;
 
+  if (openerFallbackTimer) {
+    clearTimeout(openerFallbackTimer);
+    openerFallbackTimer = null;
+  }
+
+  const wrongNumberAlreadyHandled =
+    callState === CALL_STATE.WRONG_NUMBER;
+
+  callState = CALL_STATE.ENDED;
 
 
 
@@ -1161,7 +1581,9 @@ ${fullCallTranscript}
     console.log("CALL SUMMARY:", summary);
   }
 
-if (!sellerSpoke) {
+if (wrongNumberAlreadyHandled) {
+  console.log("Skipping final classification because wrong number was already detected.");
+} else if (!sellerUtteranceDetected) {
 updateGHL(
   "no_answer_voicemail",
   "No answer or voicemail reached. No meaningful seller response.",
@@ -1194,6 +1616,13 @@ updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
   twilioWs.on("close", () => {
     console.log("Twilio websocket closed");
 
+    if (openerFallbackTimer) {
+      clearTimeout(openerFallbackTimer);
+      openerFallbackTimer = null;
+    }
+
+    openerInProgress = false;
+
     if (openAiWs.readyState === WebSocket.OPEN) {
       openAiWs.close();
     }
@@ -1205,6 +1634,13 @@ updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
 
   openAiWs.on("close", () => {
     console.log("OpenAI websocket closed");
+
+    if (openerFallbackTimer) {
+      clearTimeout(openerFallbackTimer);
+      openerFallbackTimer = null;
+    }
+
+    openerInProgress = false;
   });
 
   openAiWs.on("error", (err) => {
