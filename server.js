@@ -545,8 +545,27 @@ app.get("/call-notes/:callSid", (req, res) => {
 });
 
 app.all("/voice", (req, res) => {
+  const answeredBy = String(
+    req.body.AnsweredBy || req.query.AnsweredBy || ""
+  ).toLowerCase();
+
+  console.log("VOICE ANSWERED BY:", answeredBy);
+
+  if (
+    answeredBy.includes("machine") ||
+    answeredBy.includes("fax")
+  ) {
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Hangup/>
+</Response>`;
+
+    return res.type("text/xml").send(twiml);
+  }
+
   const publicBaseUrl = getPublicBaseUrl(req);
-  const wsUrl = publicBaseUrl.replace(/^http/i, "ws") + "/media-stream";
+  const wsUrl =
+    publicBaseUrl.replace(/^http/i, "ws") + "/media-stream";
 
   console.log("VOICE HIT:", wsUrl);
 
@@ -803,9 +822,6 @@ app.post("/start-call", async (req, res) => {
   url: `${publicBaseUrl}/voice`,
       
       machineDetection: "Enable",
-asyncAmd: true,
-asyncAmdStatusCallback: `${publicBaseUrl}/amd-status`,
-asyncAmdStatusCallbackMethod: "POST",
       
   statusCallback: `${publicBaseUrl}/call-status`,
   statusCallbackEvent: ["completed", "no-answer", "busy",  "failed"],
