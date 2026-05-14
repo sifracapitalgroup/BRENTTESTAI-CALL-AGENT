@@ -1213,8 +1213,14 @@ elevenWs.on("error", (err) => {
   console.error("ElevenLabs websocket error:", err);
 });
 
-elevenWs.on("close", () => {
-  console.log("ElevenLabs websocket closed");
+elevenWs.on("close", (code, reason) => {
+  console.log(
+    "ElevenLabs websocket closed",
+    "code:",
+    code,
+    "reason:",
+    reason?.toString?.() || ""
+  );
 });
   
   await sendSessionUpdate();
@@ -1236,13 +1242,17 @@ openAiWs.on("message", (data) => {
     const event = JSON.parse(data.toString());
     console.log("OPENAI EVENT:", event.type);
     
-if (event.type === "response.text.delta") {
+if (
+  event.type === "response.text.delta" ||
+  event.type === "response.output_text.delta"
+) {
+  const delta = event.delta ?? "";
 
-  assistantTextBuffer += event.delta;
+  assistantTextBuffer += delta;
 
-  elevenBuffer += event.delta;
+  elevenBuffer += delta;
 
-  console.log("AI TEXT DELTA:", event.delta);
+  console.log("AI TEXT DELTA:", delta);
 
   const shouldFlush =
     elevenBuffer.includes(".") ||
