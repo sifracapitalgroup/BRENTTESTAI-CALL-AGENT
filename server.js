@@ -1152,28 +1152,45 @@ console.log(
     );
   }
 
- function interruptAssistant() {
+  /** @returns {boolean} whether playback was interrupted (Twilio clear / cancel already applied when true) */
+  function interruptAssistant() {
+    if (lastAssistantItem && responseStartTimestamp !== null) {
+      callState = CALL_STATE.INTERRUPTING;
 
-  if (!lastAssistantItem || responseStartTimestamp === null) return;
+      const elapsedMs = latestMediaTimestamp - responseStartTimestamp;
 
-  callState = CALL_STATE.INTERRUPTING;
+      openAiWs.send(
+        JSON.stringify({
+          type: "conversation.item.truncate",
+          item_id: lastAssistantItem,
+          content_index: 0,
+          audio_end_ms: elapsedMs,
+        })
+      );
 
-  const elapsedMs = latestMediaTimestamp - responseStartTimestamp;
+      clearTwilioAudio();
 
-  openAiWs.send(
-    JSON.stringify({
-      type: "conversation.item.truncate",
-      item_id: lastAssistantItem,
-      content_index: 0,
-      audio_end_ms: elapsedMs,
-    })
-  );
+      lastAssistantItem = null;
+      responseStartTimestamp = null;
+      return true;
+    }
 
-  clearTwilioAudio();
+    if (aiSpeaking) {
+      callState = CALL_STATE.INTERRUPTING;
+      clearTwilioAudio();
+      if (aiSpeechTimeout) {
+        clearTimeout(aiSpeechTimeout);
+        aiSpeechTimeout = null;
+      }
+      aiSpeaking = false;
+      if (openAiWs.readyState === WebSocket.OPEN) {
+        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+      }
+      return true;
+    }
 
-  lastAssistantItem = null;
-  responseStartTimestamp = null;
-}
+    return false;
+  }
 
 openAiWs.on("open", async () => {
   console.log("Connected to OpenAI Realtime");
@@ -1455,29 +1472,28 @@ fullCallTranscript += `SELLER: ${transcript}\n`;
 
 
     // user starts speaking → stop any current playback (realtime mode only)
-if (event.type === "input_audio_buffer.speech_started") {
-  console.log("Possible user speech detected");
+    if (event.type === "input_audio_buffer.speech_started") {
+      console.log("Possible user speech detected");
 
-  const canInterrupt =
-    callState === CALL_STATE.LISTENING ||
-    callState === CALL_STATE.RESPONDING;
+      const canInterrupt =
+        callState === CALL_STATE.LISTENING ||
+        callState === CALL_STATE.RESPONDING;
 
-  if (!canInterrupt) {
-    console.log("Ignoring speech_started during opener/startup");
-    return;
-  }
+      if (!canInterrupt) {
+        console.log("Ignoring speech_started during opener/startup");
+        return;
+      }
 
- if (!aiSpeaking) {
-  interruptAssistant();
-}
+      const interrupted = interruptAssistant();
 
-  setTimeout(() => {
-    clearTwilioAudio();
-    if (callState === CALL_STATE.INTERRUPTING) {
-      callState = CALL_STATE.LISTENING;
+      if (interrupted) {
+        setTimeout(() => {
+          if (callState === CALL_STATE.INTERRUPTING) {
+            callState = CALL_STATE.LISTENING;
+          }
+        }, 450);
+      }
     }
-  }, 450);
-}
 
     if (event.type === "input_audio_buffer.speech_stopped") {
       if (
