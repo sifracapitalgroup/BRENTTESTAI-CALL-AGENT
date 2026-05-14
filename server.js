@@ -1221,21 +1221,45 @@ elevenWs.on("open", () => {
 
 elevenWs.on("message", (data) => {
 
-  const audioChunk = JSON.parse(data.toString());
+  console.log("RAW ELEVEN MESSAGE:", data.toString());
 
- if (audioChunk.audio) {
+  try {
 
-  aiSpeaking = true;
+    const audioChunk = JSON.parse(data.toString());
 
-  clearTimeout(aiSpeechTimeout);
+    console.log("PARSED ELEVEN MESSAGE:", audioChunk);
 
-  aiSpeechTimeout = setTimeout(() => {
-    aiSpeaking = false;
-    console.log("AI SPEAKING ENDED");
-  }, 1400);
+    if (audioChunk.audio) {
 
-  forwardAssistantAudioToTwilio(audioChunk.audio);
-}
+      console.log("ELEVEN AUDIO RECEIVED");
+
+      aiSpeaking = true;
+
+      clearTimeout(aiSpeechTimeout);
+
+      aiSpeechTimeout = setTimeout(() => {
+
+        aiSpeaking = false;
+
+        console.log("AI SPEAKING ENDED");
+
+      }, 1400);
+
+      console.log("FORWARDING AUDIO TO TWILIO");
+
+      forwardAssistantAudioToTwilio(audioChunk.audio);
+
+    } else {
+
+      console.log("NO AUDIO FIELD FOUND");
+
+    }
+
+  } catch (err) {
+
+    console.error("ELEVEN MESSAGE PARSE ERROR:", err);
+
+  }
 
 });
 
@@ -1297,7 +1321,8 @@ if (
   ) {
 
     elevenWs.send(JSON.stringify({
-      text: elevenBuffer
+     text: elevenBuffer,
+flush: true
     }));
 
     console.log("SENT TO ELEVEN:", elevenBuffer);
@@ -1546,7 +1571,8 @@ openAiWs.send(
   ) {
 
     elevenWs.send(JSON.stringify({
-      text: elevenBuffer
+     text: elevenBuffer,
+flush: true
     }));
 
     console.log("FINAL ELEVEN FLUSH:", elevenBuffer);
