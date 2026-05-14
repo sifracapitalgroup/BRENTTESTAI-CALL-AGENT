@@ -545,8 +545,30 @@ app.get("/call-notes/:callSid", (req, res) => {
 });
 
 app.all("/voice", (req, res) => {
+  const answeredBy = String(
+    req.body.AnsweredBy || req.query.AnsweredBy || ""
+  ).toLowerCase();
+
+  console.log("VOICE ANSWERED BY:", answeredBy);
+
+  if (
+    answeredBy.includes("machine") ||
+    answeredBy.includes("fax")
+  ) {
+
+    console.log("VOICEMAIL DETECTED BEFORE AI");
+
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Hangup/>
+</Response>`;
+
+    return res.type("text/xml").send(twiml);
+  }
+
   const publicBaseUrl = getPublicBaseUrl(req);
-  const wsUrl = publicBaseUrl.replace(/^http/i, "ws") + "/media-stream";
+  const wsUrl =
+    publicBaseUrl.replace(/^http/i, "ws") + "/media-stream";
 
   console.log("VOICE HIT:", wsUrl);
 
@@ -772,9 +794,7 @@ app.post("/start-call", async (req, res) => {
   from: process.env.TWILIO_PHONE_NUMBER,
   url: `${publicBaseUrl}/voice`,
       
-      machineDetection: "DetectMessageEnd",
-asyncAmd: true,
-asyncAmdStatusCallback: `${publicBaseUrl}/amd-status`,
+      machineDetection: "Enable",
       
   statusCallback: `${publicBaseUrl}/call-status`,
   statusCallbackEvent: ["completed", "no-answer", "busy",  "failed"],
@@ -984,7 +1004,7 @@ function scheduleEndCall(reason) {
       if (callSid) {
         console.log("FORCE END CALL:", callSid);
 
-        twilioClient.calls(callSid).update({
+        await twilioClient.calls(callSid).update({
   status: "completed"
 });
       }
@@ -1389,7 +1409,7 @@ if (event.type === "conversation.item.input_audio_transcription.completed") {
 
   console.log("MACHINE SCORE:", machineScore);
 
-  if (machineScore >= 4) {
+  if (machineScore >= 3) {
 
     console.log("VOICEMAIL / IVR DETECTED");
 
@@ -1410,9 +1430,9 @@ if (event.type === "conversation.item.input_audio_transcription.completed") {
 
     try {
 
-      twilioClient.calls(callSid).update({
-        status: "completed"
-      });
+      await twilioClient.calls(callSid).update({
+  status: "completed"
+});
 
       console.log("VOICEMAIL CALL ENDED");
 
