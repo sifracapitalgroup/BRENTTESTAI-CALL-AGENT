@@ -818,6 +818,8 @@ wss.on("connection", (twilioWs) => {
   let assistantTextBuffer = "";
   let elevenWs = null;
   let elevenBuffer = "";
+  let aiSpeaking = false;
+  let aiSpeechTimeout = null;
   /** Post-opener seller lines appended to fullTranscript for classification. */
   let sellerEngagedPostOpener = false;
   /** Any completed seller transcription (legacy sellerSpoke semantics for CRM). */
@@ -832,6 +834,7 @@ wss.on("connection", (twilioWs) => {
   const MAX_PENDING_MEDIA_CHUNKS = 4000;
   let openerResponseSent = false;
   let openerFallbackTimer = null;
+  let responseInProgress = false;
 
   const openAiWs = new WebSocket(
   "wss://api.openai.com/v1/realtime?model=gpt-realtime-2",
@@ -1043,9 +1046,9 @@ Mention the property address naturally.
 
       turn_detection: {
         type: "server_vad",
-        threshold: 0.76,
-        prefix_padding_ms: 850,
-        silence_duration_ms: 650,
+        threshold: 0.95,
+        prefix_padding_ms: 500,
+        silence_duration_ms: 1000,
         create_response: false,
         interrupt_response: true,
       }
@@ -1203,9 +1206,19 @@ elevenWs.on("message", (data) => {
 
   const audioChunk = JSON.parse(data.toString());
 
-  if (audioChunk.audio) {
-    forwardAssistantAudioToTwilio(audioChunk.audio);
-  }
+ if (audioChunk.audio) {
+
+  aiSpeaking = true;
+
+  clearTimeout(aiSpeechTimeout);
+
+  aiSpeechTimeout = setTimeout(() => {
+    aiSpeaking = false;
+    console.log("AI SPEAKING ENDED");
+  }, 1400);
+
+  forwardAssistantAudioToTwilio(audioChunk.audio);
+}
 
 });
 
@@ -1258,7 +1271,6 @@ if (
     elevenBuffer.includes(".") ||
     elevenBuffer.includes("?") ||
     elevenBuffer.includes("!") ||
-    elevenBuffer.includes(",") ||
     elevenBuffer.length > 120;
 
   if (
@@ -1346,7 +1358,7 @@ if (event.type === "conversation.item.input_audio_transcription.completed") {
     fullTranscript += `\nVOICEMAIL: ${transcript}`;
     fullCallTranscript += `VOICEMAIL: ${transcript}\n`;
 
-    interruptAssistant();
+   interruptAssistant();
 
     openAiWs.send(JSON.stringify({
       type: "response.cancel"
@@ -1455,7 +1467,9 @@ if (event.type === "input_audio_buffer.speech_started") {
     return;
   }
 
+ if (!aiSpeaking) {
   interruptAssistant();
+}
 
   setTimeout(() => {
     clearTwilioAudio();
@@ -1488,18 +1502,26 @@ if (event.type === "input_audio_buffer.speech_started") {
 
       if (openAiWs.readyState !== WebSocket.OPEN) return;
 
-      console.log("SPEECH STOPPED → response.create (manual reply turn)");
+if (responseInProgress) {
+  return;
+}
 
-      openAiWs.send(
-        JSON.stringify({
-          type: "response.create",
-        })
-      );
-    }
+responseInProgress = true;
+
+console.log("SPEECH STOPPED → response.create (manual reply turn)");
+
+openAiWs.send(
+  JSON.stringify({
+    type: "response.create",
+  })
+);
+      }
 
 
     // safety: end-call checks
    if (event.type === "response.done") {
+
+  responseInProgress = false;
 
   if (
     elevenBuffer &&
@@ -1528,24 +1550,25 @@ if (event.type === "input_audio_buffer.speech_started") {
 
   const text = JSON.stringify(event);
 
-  
+  if (shouldEndCall(text)) {
+    scheduleEndCall(text);
+  }
 
-      if (shouldEndCall(text)) {
-        scheduleEndCall(text);
-      }
+  if (
+    callState === CALL_STATE.RESPONDING ||
+    callState === CALL_STATE.INTERRUPTING
+  ) {
+    callState = CALL_STATE.LISTENING;
+  }
 
-      if (
-        callState === CALL_STATE.RESPONDING ||
-        callState === CALL_STATE.INTERRUPTING
-      ) {
-        callState = CALL_STATE.LISTENING;
-      }
-
-      responseStartTimestamp = null;
-      lastAssistantItem = null;
-    }
+  responseStartTimestamp = null;
+  lastAssistantItem = null;
+}
 
     if (event.type === "error") {
+      
+        responseInProgress = false;
+
       console.error("OpenAI realtime error:", event.error || event);
     }
   } catch (err) {
@@ -1591,6 +1614,10 @@ setTimeout(() => {
   if (!sellerAudioEnabled) {
     return;
   }
+
+     if (aiSpeaking) {
+  return;
+}
 
   if (openAiWs.readyState === WebSocket.OPEN) {
 
