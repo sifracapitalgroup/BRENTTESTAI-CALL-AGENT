@@ -545,27 +545,8 @@ app.get("/call-notes/:callSid", (req, res) => {
 });
 
 app.all("/voice", (req, res) => {
-  const answeredBy = String(
-    req.body.AnsweredBy || req.query.AnsweredBy || ""
-  ).toLowerCase();
-
-  console.log("VOICE ANSWERED BY:", answeredBy);
-
-  if (
-    answeredBy.includes("machine") ||
-    answeredBy.includes("fax")
-  ) {
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Hangup/>
-</Response>`;
-
-    return res.type("text/xml").send(twiml);
-  }
-
   const publicBaseUrl = getPublicBaseUrl(req);
-  const wsUrl =
-    publicBaseUrl.replace(/^http/i, "ws") + "/media-stream";
+  const wsUrl = publicBaseUrl.replace(/^http/i, "ws") + "/media-stream";
 
   console.log("VOICE HIT:", wsUrl);
 
@@ -649,41 +630,11 @@ if (
   }
 });
 
-app.post("/amd-status", async (req, res) => {
-  try {
-    console.log("AMD STATUS:", req.body);
+app.post("/amd-status", (req, res) => {
 
-    const callSid = req.body.CallSid;
-    const answeredBy = String(req.body.AnsweredBy || "").toLowerCase();
+  console.log("AMD STATUS:", req.body);
 
-    const isMachine =
-      answeredBy.includes("machine") ||
-      answeredBy.includes("fax");
-
-    if (isMachine && callSid) {
-      console.log("AMD MACHINE DETECTED — ENDING CALL:", answeredBy);
-
-      const phone =
-        callSidToLeadPhone.get(callSid) ||
-        req.body.To ||
-        req.body.Called;
-
-      await updateGHL(
-        "no_answer_voicemail",
-        `Voicemail/machine detected by Twilio AMD: ${answeredBy}. Call ended before leaving a message.`,
-        phone
-      );
-
-      await twilioClient.calls(callSid).update({
-        status: "completed",
-      });
-    }
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("AMD STATUS ERROR:", err);
-    res.sendStatus(500);
-  }
+  res.sendStatus(200);
 });
 
 app.post("/recording", async (req, res) => {
@@ -821,7 +772,9 @@ app.post("/start-call", async (req, res) => {
   from: process.env.TWILIO_PHONE_NUMBER,
   url: `${publicBaseUrl}/voice`,
       
-      machineDetection: "Enable",
+      machineDetection: "DetectMessageEnd",
+asyncAmd: true,
+asyncAmdStatusCallback: `${publicBaseUrl}/amd-status`,
       
   statusCallback: `${publicBaseUrl}/call-status`,
   statusCallbackEvent: ["completed", "no-answer", "busy",  "failed"],
@@ -1394,7 +1347,7 @@ if (event.type === "conversation.item.input_audio_transcription.completed") {
 
   console.log("MACHINE SCORE:", machineScore);
 
-  if (machineScore >= 3) {
+  if (machineScore >= 4) {
 
     console.log("VOICEMAIL / IVR DETECTED");
 
