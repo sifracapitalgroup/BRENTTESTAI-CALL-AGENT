@@ -1677,10 +1677,6 @@ setTimeout(() => {
     return;
   }
 
-     if (aiSpeaking) {
-  return;
-}
-
   if (openAiWs.readyState === WebSocket.OPEN) {
 
     openAiWs.send(
