@@ -1311,7 +1311,7 @@ elevenWs.on("close", (code, reason) => {
 
 let fullTranscript = ""; 
 
-openAiWs.on("message", (data) => {
+openAiWs.on("message", async (data) => {
   try {
     const event = JSON.parse(data.toString());
     console.log("OPENAI EVENT:", event.type);
