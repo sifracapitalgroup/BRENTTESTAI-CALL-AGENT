@@ -1046,12 +1046,13 @@ Mention the property address naturally.
         threshold: 0.76,
         prefix_padding_ms: 850,
         silence_duration_ms: 650,
-        /** We drive the opener with an explicit `response.create`; VAD-only auto replies can starve the opener. */
         create_response: false,
         interrupt_response: true,
       }
     }
   }
+ }
+};
 
    
 console.log(
@@ -1267,14 +1268,6 @@ if (event.type === "response.text.delta") {
 
 }
   
-
-    elevenWs.send(JSON.stringify({
-      text: event.delta
-    }));
-
-  }
-
-}
     
     if (event.type === "response.output_audio.delta") {
 
