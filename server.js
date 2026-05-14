@@ -630,11 +630,41 @@ if (
   }
 });
 
-app.post("/amd-status", (req, res) => {
+app.post("/amd-status", async (req, res) => {
+  try {
+    console.log("AMD STATUS:", req.body);
 
-  console.log("AMD STATUS:", req.body);
+    const callSid = req.body.CallSid;
+    const answeredBy = String(req.body.AnsweredBy || "").toLowerCase();
 
-  res.sendStatus(200);
+    const isMachine =
+      answeredBy.includes("machine") ||
+      answeredBy.includes("fax");
+
+    if (isMachine && callSid) {
+      console.log("AMD MACHINE DETECTED — ENDING CALL:", answeredBy);
+
+      const phone =
+        callSidToLeadPhone.get(callSid) ||
+        req.body.To ||
+        req.body.Called;
+
+      await updateGHL(
+        "no_answer_voicemail",
+        `Voicemail/machine detected by Twilio AMD: ${answeredBy}. Call ended before leaving a message.`,
+        phone
+      );
+
+      await twilioClient.calls(callSid).update({
+        status: "completed",
+      });
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("AMD STATUS ERROR:", err);
+    res.sendStatus(500);
+  }
 });
 
 app.post("/recording", async (req, res) => {
@@ -772,9 +802,10 @@ app.post("/start-call", async (req, res) => {
   from: process.env.TWILIO_PHONE_NUMBER,
   url: `${publicBaseUrl}/voice`,
       
-      machineDetection: "DetectMessageEnd",
+      machineDetection: "Enable",
 asyncAmd: true,
 asyncAmdStatusCallback: `${publicBaseUrl}/amd-status`,
+asyncAmdStatusCallbackMethod: "POST",
       
   statusCallback: `${publicBaseUrl}/call-status`,
   statusCallbackEvent: ["completed", "no-answer", "busy",  "failed"],
@@ -1347,7 +1378,7 @@ if (event.type === "conversation.item.input_audio_transcription.completed") {
 
   console.log("MACHINE SCORE:", machineScore);
 
-  if (machineScore >= 4) {
+  if (machineScore >= 3) {
 
     console.log("VOICEMAIL / IVR DETECTED");
 
