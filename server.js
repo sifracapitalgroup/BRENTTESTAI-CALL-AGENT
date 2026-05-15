@@ -544,43 +544,23 @@ app.get("/call-notes/:callSid", (req, res) => {
   });
 });
 
-app.all("/voice", (req, res) => {
-  const answeredBy = String(
-    req.body.AnsweredBy || req.query.AnsweredBy || ""
-  ).toLowerCase();
+function isTwilioAmdMachineOrFax(answeredByRaw) {
+  const answeredBy = String(answeredByRaw || "").toLowerCase();
+  return (
+    answeredBy.includes("machine") || answeredBy.includes("fax")
+  );
+}
 
-  console.log("VOICE ANSWERED BY:", answeredBy);
-
-  if (
-    answeredBy.includes("machine") ||
-    answeredBy.includes("fax")
-  ) {
-
-    console.log("VOICEMAIL DETECTED BEFORE AI");
-
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Hangup/>
-</Response>`;
-
-    return res.type("text/xml").send(twiml);
-  }
-
-  const publicBaseUrl = getPublicBaseUrl(req);
-  const wsUrl =
-    publicBaseUrl.replace(/^http/i, "ws") + "/media-stream";
-
-  console.log("VOICE HIT:", wsUrl);
-
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${wsUrl}" />
-  </Connect>
-</Response>`;
-
-  res.type("text/xml").send(twiml);
-});
+function resolveOutboundLeadPhone(req) {
+  const callSid = req.body.CallSid || req.query.CallSid;
+  return (
+    (callSid && callSidToLeadPhone.get(callSid)) ||
+    req.body.To ||
+    req.body.Called ||
+    req.query.To ||
+    ""
+  );
+}
 
 async function updateGHL(outcome, summary, phoneOverride) {
   try {
@@ -620,30 +600,106 @@ async function updateGHL(outcome, summary, phoneOverride) {
   }
 }
 
+/** Dedupe GHL "no answer" from AMD: both `/voice` and `completed` status may fire. */
+const twilioAmdNoAnswerGhlSyncedCallSids = new Set();
+
+async function syncTwilioAmdNoAnswerToGhl(callSid, answeredByRaw, phone, detailSuffix) {
+  if (callSid && twilioAmdNoAnswerGhlSyncedCallSids.has(callSid)) {
+    return;
+  }
+  if (callSid) {
+    twilioAmdNoAnswerGhlSyncedCallSids.add(callSid);
+  }
+
+  const base = `Twilio AMD blocked the call (answered_by=${answeredByRaw || "machine"}); no AI session.`;
+  const detail = detailSuffix ? `${base} ${detailSuffix}` : base;
+
+  await updateGHL("no_answer_voicemail", detail, phone);
+}
+
+app.all("/voice", (req, res) => {
+  const answeredByRaw = req.body.AnsweredBy || req.query.AnsweredBy || "";
+  const answeredBy = String(answeredByRaw).toLowerCase();
+
+  console.log("VOICE ANSWERED BY:", answeredBy);
+
+  if (isTwilioAmdMachineOrFax(answeredByRaw)) {
+    console.log("VOICEMAIL DETECTED BEFORE AI");
+
+    const phone = resolveOutboundLeadPhone(req);
+
+    void syncTwilioAmdNoAnswerToGhl(
+      req.body.CallSid || req.query.CallSid,
+      answeredByRaw,
+      phone
+    ).catch((err) => {
+      console.error("GHL UPDATE (AMD hangup /voice):", err);
+    });
+
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Hangup/>
+</Response>`;
+
+    return res.type("text/xml").send(twiml);
+  }
+
+  const publicBaseUrl = getPublicBaseUrl(req);
+  const wsUrl =
+    publicBaseUrl.replace(/^http/i, "ws") + "/media-stream";
+
+  console.log("VOICE HIT:", wsUrl);
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}" />
+  </Connect>
+</Response>`;
+
+  res.type("text/xml").send(twiml);
+});
+
 app.post("/call-status", async (req, res) => {
   try {
     console.log("CALL STATUS:", req.body);
 
-const callStatus = req.body.CallStatus;
-const callDuration = Number(req.body.Duration || req.body.CallDuration || 0);
-const phone = req.body.To || req.body.Called;
+    const callStatus = req.body.CallStatus;
+    const callDuration = Number(req.body.Duration || req.body.CallDuration || 0);
+    const phone =
+      (req.body.CallSid && callSidToLeadPhone.get(req.body.CallSid)) ||
+      req.body.To ||
+      req.body.Called;
 
-console.log("PHONE FROM TWILIO:", phone);
-console.log("CALL DURATION USED:", callDuration);
+    const answeredByRaw = req.body.AnsweredBy || "";
+    const amdVoicemail = isTwilioAmdMachineOrFax(answeredByRaw);
 
-if (
-  callStatus === "no-answer" ||
-  callStatus === "busy" ||
-  callStatus === "failed"
-) {
-  console.log("TRIGGERING GHL UPDATE FOR NO ANSWER");
+    console.log("PHONE FROM TWILIO:", phone);
+    console.log("CALL DURATION USED:", callDuration);
+    console.log("CALL STATUS ANSWERED BY:", answeredByRaw);
 
-  await updateGHL(
-    "no_answer_voicemail",
-    `Call ended with status: ${callStatus} and duration ${callDuration} seconds.`,
-    phone
-  );
-}
+    if (
+      callStatus === "no-answer" ||
+      callStatus === "busy" ||
+      callStatus === "failed"
+    ) {
+      console.log("TRIGGERING GHL UPDATE FOR NO ANSWER");
+
+      await updateGHL(
+        "no_answer_voicemail",
+        `Call ended with status: ${callStatus} and duration ${callDuration} seconds.`,
+        phone
+      );
+    } else if (amdVoicemail && callStatus === "completed") {
+      console.log("TRIGGERING GHL UPDATE FOR AMD VOICEMAIL (COMPLETED)");
+
+      await syncTwilioAmdNoAnswerToGhl(
+        req.body.CallSid,
+        answeredByRaw,
+        phone,
+        `Call completed; duration ${callDuration}s.`
+      );
+    }
 
     res.sendStatus(200);
   } catch (err) {
