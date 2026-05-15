@@ -837,8 +837,6 @@ const call_notes =
 
     const cleanPhone = String(phone || "").trim();
 
-    const cleanPhone = String(phone || "").trim();
-
 currentCallLead = {
   first_name:
     first_name ||
