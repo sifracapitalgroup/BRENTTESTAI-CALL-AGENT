@@ -22,8 +22,260 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 let currentCallLead = {};
 let callNotesBySid = {};
+
+let dialerRunning = false;
+let activeCall = false;
+let activeCallSid = null;
+
+/** Tear down OpenAI/Eleven/Twilio sockets keyed by Twilio CallSid. */
+const mediaSessionsByCallSid = new Map();
+let endActiveMediaSession = null;
+let placingOutboundCall = false;
+let dialerKickTimer = null;
+/** GHL opportunity being dialed from the queue (so we can move it out of "New Lead"). */
+let currentQueuedOpportunityId = null;
+let queuedOpportunityReleased = false;
+/** Routes releaseQueuedOpportunityAfterCall to Wrong Number vs default stage. */
+let pendingQueueReleaseOutcome = null;
+/** If stage move fails, skip this opp for the rest of the process lifetime. */
+const skippedOpportunityIds = new Set();
+
+const TWILIO_INVALID_NUMBER_ERROR_CODES = new Set([
+  "13224",
+  "13223",
+  "13226",
+]);
+
+function requestEndMediaSession(callSid, reason) {
+  const teardown = callSid && mediaSessionsByCallSid.get(callSid);
+  if (!teardown) return false;
+
+  mediaSessionsByCallSid.delete(callSid);
+  try {
+    teardown(reason);
+  } catch (err) {
+    console.error("END MEDIA SESSION ERROR:", err);
+  }
+  return true;
+}
+
+function requestEndAllMediaSessions(reason) {
+  for (const [sid, teardown] of [...mediaSessionsByCallSid.entries()]) {
+    try {
+      teardown(`${reason}:${sid}`);
+    } catch (err) {
+      console.error("END MEDIA SESSION ERROR:", err);
+    }
+  }
+  mediaSessionsByCallSid.clear();
+
+  if (typeof endActiveMediaSession === "function") {
+    try {
+      endActiveMediaSession(reason);
+    } catch (err) {
+      console.error("END MEDIA SESSION ERROR:", err);
+    }
+    endActiveMediaSession = null;
+  }
+}
+
+function requestEndActiveMediaSession(reason, callSid) {
+  if (callSid && requestEndMediaSession(callSid, reason)) return;
+
+  if (typeof endActiveMediaSession === "function") {
+    try {
+      endActiveMediaSession(reason);
+    } catch (err) {
+      console.error("END MEDIA SESSION ERROR:", err);
+    }
+    endActiveMediaSession = null;
+  }
+}
+
+function finishQueueCall(forCallSid) {
+  if (!activeCall) return;
+
+  if (forCallSid && activeCallSid && forCallSid !== activeCallSid) {
+    logTime(
+      "Ignoring finishQueueCall for non-active CallSid:",
+      forCallSid,
+      "active:",
+      activeCallSid
+    );
+    return;
+  }
+
+  activeCall = false;
+  activeCallSid = null;
+
+  void releaseQueuedOpportunityAfterCall().finally(() => {
+    if (dialerRunning) {
+      logTime("Call finished. Starting next queued lead in 2 seconds.");
+      setTimeout(startNextQueuedLead, 2000);
+    }
+  });
+}
+
+function normalizeOutboundPhoneE164(phone) {
+  const raw = String(phone || "").trim();
+  if (!raw) return "";
+
+  if (raw.startsWith("+")) {
+    const digits = raw.slice(1).replace(/\D/g, "");
+    return digits ? `+${digits}` : "";
+  }
+
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return raw;
+}
+
+function isCallableE164(phone) {
+  return /^\+[1-9]\d{7,14}$/.test(String(phone || ""));
+}
+
+function resolveTerminalCallOutcome(body) {
+  const callStatus = String(body?.CallStatus || "").toLowerCase();
+  const errorCode = String(body?.ErrorCode || "");
+  const sipCode = String(body?.SipResponseCode || "");
+  const errMsg = String(body?.ErrorMessage || "").trim();
+
+  if (
+    TWILIO_INVALID_NUMBER_ERROR_CODES.has(errorCode) ||
+    (callStatus === "failed" && sipCode === "404")
+  ) {
+    return {
+      outcome: "wrong_number",
+      summary: `Number invalid or not routable (${errorCode || sipCode || callStatus})${
+        errMsg ? `: ${errMsg}` : ""
+      }. Check the contact phone in GHL.`,
+    };
+  }
+
+  if (callStatus === "failed" || callStatus === "canceled") {
+    return {
+      outcome: "no_answer_voicemail",
+      summary: `Call ended (${errorCode || callStatus})${
+        errMsg ? `: ${errMsg}` : ": could not connect"
+      }.`,
+    };
+  }
+
+  if (callStatus === "no-answer" || callStatus === "busy") {
+    return {
+      outcome: "no_answer_voicemail",
+      summary: `Call ended with status: ${callStatus}.`,
+    };
+  }
+
+  return null;
+}
+
+async function moveOpportunityToStage(opportunityId, stageName) {
+  if (!opportunityId || !stageName) return false;
+
+  try {
+    const stageId = await getStageIdByName(stageName);
+    await ghlRequest(
+      `https://services.leadconnectorhq.com/opportunities/${opportunityId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ pipelineStageId: stageId }),
+      }
+    );
+    logTime("GHL opportunity moved to stage:", stageName, opportunityId);
+    return true;
+  } catch (err) {
+    console.error("GHL STAGE MOVE ERROR:", err);
+    return false;
+  }
+}
+
+async function releaseQueuedOpportunityAfterCall() {
+  if (queuedOpportunityReleased || !currentQueuedOpportunityId) return;
+
+  queuedOpportunityReleased = true;
+  const opportunityId = currentQueuedOpportunityId;
+  currentQueuedOpportunityId = null;
+
+  const destStage =
+    pendingQueueReleaseOutcome === "wrong_number"
+      ? process.env.GHL_WRONG_NUMBER_STAGE_NAME || "Wrong Number"
+      : process.env.GHL_AFTER_CALL_STAGE_NAME || "AI Attempted";
+  pendingQueueReleaseOutcome = null;
+
+  const moved = await moveOpportunityToStage(opportunityId, destStage);
+
+  if (!moved) {
+    skippedOpportunityIds.add(opportunityId);
+    logTime(
+      "Could not move opportunity; will skip if still returned by queue:",
+      opportunityId
+    );
+  }
+}
+
+async function markDialerAttemptTerminal(outcome, summary, phone, callSid) {
+  if (callSid && callSidTerminalStatusHandled.has(callSid)) {
+    return;
+  }
+  if (callSid) {
+    callSidTerminalStatusHandled.add(callSid);
+  }
+
+  logTime("DIALER TERMINAL:", outcome, summary);
+
+  pendingQueueReleaseOutcome = outcome;
+  await updateGHL(outcome, summary, phone);
+  requestEndActiveMediaSession(`call-status:${outcome}`, callSid);
+  finishQueueCall(callSid);
+}
+
 /** Twilio recording webhooks often omit `To`/`Called`; map parent CallSid → dialed E.164. */
 const callSidToLeadPhone = new Map();
+/** Elapsed-ms prefix for call-scoped logs (reset on each /start-call). */
+let callStartTime = null;
+
+function logTime(...args) {
+  const elapsed = callStartTime != null ? Date.now() - callStartTime : 0;
+  console.log(`[${elapsed}ms]`, ...args);
+}
+
+let lastWordEmitTime = null;
+
+function trackWord(word) {
+  const w = String(word ?? "").trim();
+  if (!w) return;
+  const now = Date.now();
+  const elapsed = callStartTime != null ? now - callStartTime : 0;
+  const sincePrev = lastWordEmitTime != null ? now - lastWordEmitTime : 0;
+  lastWordEmitTime = now;
+  console.log(`[${elapsed}ms] WORD: ${w} (+${sincePrev}ms)`);
+}
+
+function createWordDeltaTracker() {
+  let buffer = "";
+  return {
+    feed(delta) {
+      if (!delta) return;
+      buffer += delta;
+      let match;
+      while ((match = buffer.match(/^(\S+)\s+/))) {
+        trackWord(match[1]);
+        buffer = buffer.slice(match[0].length);
+      }
+    },
+    flush() {
+      const tail = buffer.trim();
+      if (tail) trackWord(tail);
+      buffer = "";
+    },
+    reset() {
+      buffer = "";
+    },
+  };
+}
 
 function buildGhlContactsUpsertUrl(identifier) {
   const trimmed = String(identifier || "").trim();
@@ -113,6 +365,123 @@ const US_STATE_BY_ABBREV = Object.freeze({
   WY: "Wyoming",
 });
 
+/** GHL GET contacts return customFields as [{ id, value }]; upserts use { key, field_value }. */
+function readGhlCustomFieldEntryValue(entry) {
+  if (!entry || typeof entry !== "object") return "";
+  const val =
+    entry.value ?? entry.field_value ?? entry.fieldValue ?? entry.stringValue ?? "";
+  return String(val).trim();
+}
+
+function resolveGhlCustomFieldFromList(customFields, { fieldKey, fieldId } = {}) {
+  if (!Array.isArray(customFields)) return "";
+
+  const keyNorm = fieldKey ? String(fieldKey).trim().toLowerCase() : "";
+  const idNorm = fieldId ? String(fieldId).trim() : "";
+
+  for (const entry of customFields) {
+    if (!entry || typeof entry !== "object") continue;
+
+    const entryId = String(entry.id || entry.fieldId || "").trim();
+    const entryKey = String(
+      entry.key || entry.name || entry.fieldKey || entry.field_key || ""
+    )
+      .trim()
+      .toLowerCase();
+
+    if (idNorm && entryId === idNorm) {
+      return readGhlCustomFieldEntryValue(entry);
+    }
+    if (keyNorm && entryKey === keyNorm) {
+      return readGhlCustomFieldEntryValue(entry);
+    }
+  }
+
+  return "";
+}
+
+/** Best-effort when field id/key is unknown — first value that looks like a street address. */
+function guessPropertyAddressFromGhlCustomFields(customFields) {
+  if (!Array.isArray(customFields)) return "";
+
+  for (const entry of customFields) {
+    const val = readGhlCustomFieldEntryValue(entry);
+    if (!val) continue;
+
+    const looksLikeStreet =
+      /^\d+[-\s]?\s*\d*\s*[A-Za-z]/.test(val) &&
+      (/,/.test(val) ||
+        /\b(st|street|rd|road|ave|avenue|dr|drive|ln|lane|blvd|ct|court|apt|apartment|unit|ste|suite|way|pl|place|ter|terrace|hwy|highway)\b/i.test(
+          val
+        ));
+
+    if (looksLikeStreet) return val;
+  }
+
+  return "";
+}
+
+function resolvePropertyAddressFromGhlContact(contact) {
+  if (!contact || typeof contact !== "object") return "";
+
+  const fieldKey =
+    process.env.GHL_PROPERTY_ADDRESS_FIELD_KEY || "property_address";
+  const fieldId = process.env.GHL_PROPERTY_ADDRESS_FIELD_ID || "";
+
+  const customFields = contact.customFields;
+  let fromCustom = "";
+
+  if (Array.isArray(customFields)) {
+    fromCustom =
+      resolveGhlCustomFieldFromList(customFields, { fieldKey, fieldId }) ||
+      guessPropertyAddressFromGhlCustomFields(customFields);
+  } else if (customFields && typeof customFields === "object") {
+    fromCustom = String(
+      customFields[fieldKey] ||
+        customFields.property_address ||
+        customFields["Property Address"] ||
+        (fieldId ? customFields[fieldId] : "") ||
+        ""
+    ).trim();
+  }
+
+  return (
+    fromCustom ||
+    String(contact.property_address || contact.propertyAddress || "").trim() ||
+    String(contact.address1 || contact.address || "").trim()
+  );
+}
+
+function resolvePropertyAddressFromLeadPayload(body) {
+  const payload = body && typeof body === "object" ? body : {};
+
+  const direct = String(
+    payload.property_address ||
+      payload.propertyAddress ||
+      payload["Property Address"] ||
+      payload.address ||
+      payload.streetAddress ||
+      ""
+  ).trim();
+  if (direct) return direct;
+
+  const fromNestedContact = resolvePropertyAddressFromGhlContact(payload.contact);
+  if (fromNestedContact) return fromNestedContact;
+
+  const fieldKey =
+    process.env.GHL_PROPERTY_ADDRESS_FIELD_KEY || "property_address";
+  const fieldId = process.env.GHL_PROPERTY_ADDRESS_FIELD_ID || "";
+
+  if (Array.isArray(payload.customFields)) {
+    const fromCustom =
+      resolveGhlCustomFieldFromList(payload.customFields, { fieldKey, fieldId }) ||
+      guessPropertyAddressFromGhlCustomFields(payload.customFields);
+    if (fromCustom) return fromCustom;
+  }
+
+  return "";
+}
+
 function normalizeAddressForSpeech(address) {
 if (!address) return "";
 
@@ -121,6 +490,7 @@ return address
 .replace(/\bS\b/gi, "South")
 .replace(/\bE\b/gi, "East")
 .replace(/\bW\b/gi, "West")
+
 .replace(/\bDr\b/gi, "Drive")
 .replace(/\bRd\b/gi, "Road")
 .replace(/\bSt\b/gi, "Street")
@@ -129,7 +499,13 @@ return address
 .replace(/\bLn\b/gi, "Lane")
 .replace(/\bCt\b/gi, "Court")
 .replace(/\bPl\b/gi, "Place")
-.replace(/\bTer\b/gi, "Terrace");
+.replace(/\bTer\b/gi, "Terrace")
+
+.replace(/\bApt\b/gi, "Apartment")
+.replace(/\bSte\b/gi, "Suite")
+.replace(/\bUnit\b/gi, "Unit")
+.replace(/\bFl\b/gi, "Floor")
+.replace(/\bBldg\b/gi, "Building");
 }
 
 
@@ -204,27 +580,23 @@ function buildOpenerSpeechContext(lead) {
 
 /** Mandatory first lines (session + response.create). Server fills name/location only. */
 function buildFixedOutboundOpenerScript(ctx) {
-  const hi = `Hi ${ctx.sellerName}?`;
-  const ask = `This is Daniel - Would you potentially be open to selling your property on ${ctx.locationClause}?`;
+  const hi = `Hey ${ctx.sellerName}??`;
+  
+  const ask =
+    `This is Daniel.. ` +
+
+    
+    `I was calling about your property on ${ctx.locationClause}. ` +
+    
+    `If the numbers made sense — would you consider selling??`;
+
   return { hi, ask };
 }
 
-function buildOutboundOpenerInstructionBlock(ctx) {
+/** Full opener line for instant TTS (no Realtime generation wait). */
+function buildOpenerSpokenLine(ctx) {
   const { hi, ask } = buildFixedOutboundOpenerScript(ctx);
-  return [
-    "OPENING SCRIPT — first audio after connect (non-negotiable)",
-    "",
-    "Deliver exactly two spoken parts in order, with natural tone but verbatim wording:",
-    `1) Say exactly: ${hi}`,
-    `2) Say exactly: ${ask}`,
-    "",
-    "Do not add any words before step 1. Do not add small talk between steps 1 and 3.",
-    "Do not change the location phrase; it must match the session wording character-for-character (aside from normal capitalization in speech).",
-    "",
-    ctx.sessionRules,
-    "",
-    "After the prospect answers this opening, treat the rest of the call as a normal conversation (the fixed-script rule no longer applies).",
-  ].join("\n");
+  return `${hi} ${ask}`;
 }
 
 function buildOpenerResponseCreateInstructions(ctx) {
@@ -254,222 +626,342 @@ return [
 ].join("\n");
 }
 
+/** ElevenLabs stream-input: expressiveness presets (not semantic labels). */
+const ELEVEN_TONE_PRESETS = Object.freeze({
+  neutral: {
+    stability: 0.58,
+    similarity_boost: 0.88,
+    style: 0.12,
+    use_speaker_boost: true,
+  },
+
+  confidence: {
+    stability: 0.54,
+    similarity_boost: 0.9,
+    style: 0.18,
+    use_speaker_boost: true,
+  },
+
+  understanding: {
+    stability: 0.62,
+    similarity_boost: 0.86,
+    style: 0.10,
+    use_speaker_boost: true,
+  },
+
+  emphasis: {
+    stability: 0.5,
+    similarity_boost: 0.9,
+    style: 0.22,
+    use_speaker_boost: true,
+  },
+});
+
+const SELLER_PUSHBACK_PHRASES = [
+  "not interested",
+  "don't call",
+  "do not call",
+  "stop calling",
+  "no thanks",
+  "not selling",
+  "take me off",
+  "leave me alone",
+  "already told you",
+];
+
+const EMPATHY_SELLER_PHRASES = [
+  "passed away",
+  "divorce",
+  "hard time",
+  "struggling",
+  "foreclosure",
+  "probate",
+  "sick",
+  "hospital",
+];
+
+const EMPHASIS_TOPIC_WORDS = [
+  "price",
+  "number",
+  "timeline",
+  "month",
+  "months",
+  "days",
+  "offer",
+  "worth",
+  "dollar",
+  "cash",
+];
+
+/** Default voice for the whole call — set once on Eleven WS init only. */
+const ELEVEN_SESSION_VOICE_SETTINGS = ELEVEN_TONE_PRESETS.neutral;
+
+function shapeTextForEleven(text, tone = "neutral") {
+  let t = String(text || "");
+  t = t.replace(/\[\[(?:tone|mode):\s*[\w-]+\]\]/gi, "");
+  t = t.replace(/\*\*([^*]+)\*\*/g, "$1");
+  t = t.replace(/\s+/g, " ").trim();
+
+  if (tone === "understanding" && t && !/[.!?…]/.test(t.slice(-1))) {
+    t += ".";
+  }
+
+  return t;
+}
+
+function normalizeApostrophes(text) {
+  return String(text || "")
+    .replace(/[\u2018\u2019\u2032]/g, "'")
+    .replace(/[\u201C\u201D\u2033]/g, '"');
+}
+
+/**
+ * Mid-response TTS flush: stream statements early, but never split on "?".
+ * Multiple Eleven flushes on "?" caused back-to-back questions in one turn.
+ */
+function shouldFlushElevenBuffer(buffer, { forceFinal = false } = {}) {
+  const text = String(buffer || "");
+  if (!text.trim()) return false;
+  if (forceFinal) return true;
+  if (text.length >= 220) return true;
+  return /[.!](?:\s|$)/.test(text);
+}
+
+function inferElevenTone(callState, lastSellerLine, assistantText) {
+  const seller = String(lastSellerLine || "").toLowerCase();
+  const assistant = String(assistantText || "").toLowerCase();
+
+  if (callState === CALL_STATE.OPENING) return "confidence";
+
+  if (
+    SELLER_PUSHBACK_PHRASES.some((p) => seller.includes(p)) ||
+    EMPATHY_SELLER_PHRASES.some((p) => seller.includes(p))
+  ) {
+    return "understanding";
+  }
+
+  if (EMPHASIS_TOPIC_WORDS.some((p) => seller.includes(p) || assistant.includes(p))) {
+    return "emphasis";
+  }
+
+  return "neutral";
+}
+
 
 const SYSTEM_PROMPT = `
-# 1. RULES
+You are Daniel, a real estate investor calling property owners about potential off-market acquisitions.
 
-You are Daniel, a real estate investor calling property owners.
+CRITICAL CONVERSATION RULES
 
-Speak like a real operator — calm, direct, controlled, and natural.
+You must speak in SHORT conversational turns.
 
-Use short sentences.
-Let the seller speak.
+Maximum:
+- 1 thought
+- 1 idea
+- 1 question
 
----
+per response.
 
-LANGUAGE RULE
+Never ask multiple questions.
 
-Speak ONLY in English. UNLESS ASKED / and OTHER LANGUAGE IDENTIFIED /
+Never add a follow-up question in the same response.
 
----
+Never continue talking after asking a question.
 
-TONE + DELIVERY
+After asking a question, STOP SPEAKING.
 
-* Match the seller’s energy
-* Slow down if seller shares something meaningful
-* Never stack questions
-* Keep the conversation natural and conversational
-* Listen carefully before responding
-* Do not paraphrase every seller response
-* Keep acknowledgements brief and natural
+Do not explain your question.
 
----
+Do not summarize multiple ideas together.
 
-CONVERSATION CONTROL
+Do not stack conversational fillers.
 
-If seller goes off topic:
+Bad example:
+"So are you living there now, and has it been updated recently?"
 
-* briefly acknowledge it
-* then naturally redirect back to the property
+Bad example:
+"Gotcha, makes sense. And what were you hoping to get for it?"
 
----
+Good example:
+"You living there now?"
 
-CRITICAL RULES
+Good example:
+"What kind of condition is it in?"
 
-* NEVER say “in regards to”
-* NEVER say “confirm” or “verify”
-* NEVER sound like a script
-* NEVER argue with the seller
-* NEVER push hard on price early
-* NEVER sound overly excited
-* NEVER sound robotic
-* NEVER interrogate the seller
+If a response exceeds 2 short sentences, shorten it.
 
----
+You are calm and minimal.
 
-YOUR ROLE
 
-You are:
+IMPORTANT:
 
-* calm under control
-* slightly curious
-* easy to talk to
-* leading without force
+Silence is normal in conversation.
 
-You are NOT:
+Do not try to fill silence.
 
-* aggressive
-* robotic
-* overly friendly
-* overly analytical
+Do not continue speaking because the seller pauses.
 
-==================================================
-
-# 2. SCRIPT / CALL FLOW
-
-==================================================
-
-IF SELLER PUSHES BACK / SAYS NO
-
-Goal:
-
-* soften resistance
-* keep conversation alive
-* uncover flexibility
-
-Example:
-
-“Sounds like you’re probably not looking right now.”
-
-“If someone came in with the right number though…
-you’d at least take a look, right?”
-
-“Right — so there is a number that would make sense.”
-
-“That’s all I’m trying to figure out.”
-
-“Give me like 30 seconds — let me just understand the property real quick.”
+Shorter is better.
 
 ---
 
-PROPERTY INFO
 
-Goal:
+## SECTION 2 — CONDITION
 
-* determine occupancy and basic situation
+OBJECTIVE:
+Understand physical condition naturally and conversationally.
 
-Examples:
+RULES:
 
-“Are you living there now or is it rented out?”
+* Avoid sounding clinical or checklist-driven.
+* Never stack rehab questions back-to-back.
+* Let the seller explain things in their own words.
+* Sound observational, not investigative.
+* Use light conversational reactions before redirecting.
 
-If vacant:
+PREFERRED QUESTIONS:
 
-* subtly mention holding costs
-* then continue naturally
+* "Quick question — just making sure I have it right... it's about (sq ft) square feet?"
+
+IF SELLER IS VAGUE:
+
+* "Gotcha..."
+* "Yeah that makes sense."
+* "Okay, I hear you."
+* "Alright."
+
+DELIVERY NOTES:
+
+* Slow down slightly before key words like "million dollar", "full gut", "major work".
+* Add subtle conversational pauses naturally.
+* Avoid sounding overly sharp or robotic.
+
+REDIRECT TO SECTION 3 ->
+---
+
+## SECTION 3 — PROPERTY STATUS
+
+OBJECTIVE:
+Understand occupancy and current use naturally.
+
+LOOK FOR:
+
+* owner occupied
+* tenant occupied
+* vacant
+* listed
+* inherited
+
+RULES:
+
+* NEVER HAVE BACK TO BACK QUESTION -> QUESTION ALWAYS PROCEED TO NEXT SECTION
+* Keep transitions extremely casual.
+* Do not abruptly switch topics.
+* Slightly soften direct occupancy questions.
+
+PREFERRED QUESTIONS:
+
+* "Is somebody staying there currently?"
+
+DELIVERY NOTES:
+
+* Add slight emphasis to words like "living", "currently".
+* Keep tone calm and curious — never transactional.
 
 ---
 
-CONDITION
+## SECTION 4 — TIMELINE
 
-Goal:
+OBJECTIVE:
+Understand motivation and urgency without pressure.
 
-* understand overall condition
-* determine level of updating/work needed
+RULES:
 
-Examples:
+* Never sound like you're pushing for a commitment.
+* Keep pacing relaxed.
+* Sound like you're feeling out the situation naturally.
 
-“How’s the condition overall?”
+PREFERRED QUESTIONS:
 
-“How updated is it?”
+* "If it all made sense... What's your ideal timeframe to close"
 
-“Does it need much work?”
+DELIVERY NOTES:
 
----
-
-MOTIVATION
-
-Goal:
-
-* understand why they would sell
-* uncover situation behind the sale
-
-Examples:
-
-“What would ideally happen with the property?”
-
-“What’s the situation with it right now?”
+* Use softer downward tonality at the end of timeline questions.
+* Allow natural pauses before phrases like "down the road" and "actually consider".
 
 ---
 
-TIMELINE
+## SECTION 5 — PRICE DISCUSSION
 
-Goal:
+OBJECTIVE:
+Understand expectations without sounding eager or pushy.
+ASK ONLY ONCE,
 
-* understand urgency and flexibility
+RULES:
 
-Examples:
+* Never sound desperate for a number.
+* Do not force valuation discussions early.
+* Keep tone detached and practical.
+* Condition and situation should frame pricing naturally.
 
-“If everything made sense - how soon would you want to move on it?”
+PREFERRED QUESTIONS:
 
-If unclear:
+* "Do have a ideal number in mind you would like to get for it?"
+* "Do you atleast have a relative ballpark?"
+* "A lot depends on condition and situation."
 
-“Are you thinking more like 30 days… or more a couple months?”
+PRICE MOTIVATION
+* Dont push for price ask ONCE, MAYBE TWICE DEPENDING ON SELLER RESPONSE
 
----
+DELIVERY NOTES:
 
-PRICE
+* Lower intensity during price conversations.
+* Sound thoughtful instead of reactive.
+* Never sound excited by deals or numbers.
 
-Goal:
+---------------------
 
-* uncover expectation without pressure
+## SECTION 6 — CLOSING
 
-Examples:
+OBJECTIVE:
+Exit naturally and professionally.
 
-“Do you have a number in mind - where you’d seriously consider selling?”
+RULES:
 
-Backup:
+* Never over-close.
+* Never sound needy.
+* Leave conversations open-ended and relaxed.
 
-“Just trying to understand where you’re at.”
+PREFERRED RESPONSES:
 
----
+* "I'll circle back after I take a look at everything."
 
-POSITIONING
+DELIVERY NOTES:
 
-Goal:
+* Slow final sentence slightly.
+* End calmly — not overly upbeat.
+* Let the conversation breathe at the end.
 
-* keep interaction low-pressure and straightforward
+IMPORTANT
 
-Examples:
+After the opener:
+stop sounding scripted and respond naturally within the active section.
 
-“I honestly dont like to beat around the bush”
+Prioritize:
+* natural pauses
+* conversational emphasis
+* tonal variation
+* relaxed pacing
+* understated confidence
 
-“I’m really just trying to understand whether something makes sense for both sides.”
+Avoid:
+* flat delivery
+* constant upward inflection
+* overly fast responses
+* overly polished sales energy
 
----
-
-SOFT CLOSE
-
-Goal:
-
-* exit naturally
-* preserve follow-up opportunity
-
-Examples:
-
-“What I can do is take a look at everything and see what actually makes sense.”
-
-“If it lines up, I’ll give you a call back and we can go from there.”
-
----
-
-EXIT
-
-Examples:
-
-“I’ll take a look and get back to you.”
-
-“Appreciate you taking the time.”
-
+When mentioning U.S. states, always say the full state name naturally.
 `;
 
 const MACHINE_PHRASES = [
@@ -569,7 +1061,17 @@ async function updateGHL(outcome, summary, phoneOverride) {
       console.warn("GHL UPDATE SKIPPED: missing phone/email identifier for upsert");
       return;
     }
+    
+const TAG_BY_OUTCOME = {
+  no_answer_voicemail: "ai_no_answer",
+  follow_up: "ai_follow_up",
+  interested: "ai_interested",
+  not_interested: "ai_not_interested",
+  wrong_number: "ai_wrong_number",
+};
 
+const outcomeTag = TAG_BY_OUTCOME[outcome];
+    
     const response = await fetch(upsertUrl, {
       method: "POST",
       headers: {
@@ -578,9 +1080,10 @@ async function updateGHL(outcome, summary, phoneOverride) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        locationId: process.env.GHL_LOCATION_ID,
-        phone: phoneOverride,
-        customFields: [
+  locationId: process.env.GHL_LOCATION_ID,
+  phone: phoneOverride,
+  tags: outcomeTag ? [outcomeTag] : [],
+  customFields: [
           {
             key: "ai_call_outcome",
             field_value: outcome,
@@ -594,7 +1097,7 @@ async function updateGHL(outcome, summary, phoneOverride) {
     });
 
     const data = await response.json();
-    console.log("GHL UPDATED:", data);
+    logTime("GHL UPDATED:", data);
   } catch (err) {
     console.error("GHL UPDATE ERROR:", err);
   }
@@ -602,6 +1105,9 @@ async function updateGHL(outcome, summary, phoneOverride) {
 
 /** Dedupe GHL "no answer" from AMD: both `/voice` and `completed` status may fire. */
 const twilioAmdNoAnswerGhlSyncedCallSids = new Set();
+
+/** Dedupe GHL + queue advance when `/call-status` already handled a terminal leg. */
+const callSidTerminalStatusHandled = new Set();
 
 async function syncTwilioAmdNoAnswerToGhl(callSid, answeredByRaw, phone, detailSuffix) {
   if (callSid && twilioAmdNoAnswerGhlSyncedCallSids.has(callSid)) {
@@ -621,10 +1127,10 @@ app.all("/voice", (req, res) => {
   const answeredByRaw = req.body.AnsweredBy || req.query.AnsweredBy || "";
   const answeredBy = String(answeredByRaw).toLowerCase();
 
-  console.log("VOICE ANSWERED BY:", answeredBy);
+  logTime("VOICE ANSWERED BY:", answeredBy);
 
   if (isTwilioAmdMachineOrFax(answeredByRaw)) {
-    console.log("VOICEMAIL DETECTED BEFORE AI");
+    logTime("VOICEMAIL DETECTED BEFORE AI");
 
     const phone = resolveOutboundLeadPhone(req);
 
@@ -648,7 +1154,7 @@ app.all("/voice", (req, res) => {
   const wsUrl =
     publicBaseUrl.replace(/^http/i, "ws") + "/media-stream";
 
-  console.log("VOICE HIT:", wsUrl);
+  logTime("VOICE HIT:", wsUrl);
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -662,10 +1168,12 @@ app.all("/voice", (req, res) => {
 
 app.post("/call-status", async (req, res) => {
   try {
-    console.log("CALL STATUS:", req.body);
+    logTime("CALL STATUS:", req.body);
 
     const callStatus = req.body.CallStatus;
-    const callDuration = Number(req.body.Duration || req.body.CallDuration || 0);
+    const callDuration = Number(
+      req.body.CallDuration || req.body.Duration || 0
+    );
     const phone =
       (req.body.CallSid && callSidToLeadPhone.get(req.body.CallSid)) ||
       req.body.To ||
@@ -674,31 +1182,39 @@ app.post("/call-status", async (req, res) => {
     const answeredByRaw = req.body.AnsweredBy || "";
     const amdVoicemail = isTwilioAmdMachineOrFax(answeredByRaw);
 
-    console.log("PHONE FROM TWILIO:", phone);
-    console.log("CALL DURATION USED:", callDuration);
-    console.log("CALL STATUS ANSWERED BY:", answeredByRaw);
+    logTime("PHONE FROM TWILIO:", phone);
+    logTime("CALL DURATION USED:", callDuration);
+    logTime("CALL STATUS ANSWERED BY:", answeredByRaw);
 
-    if (
-      callStatus === "no-answer" ||
-      callStatus === "busy" ||
-      callStatus === "failed"
-    ) {
-      console.log("TRIGGERING GHL UPDATE FOR NO ANSWER");
+    const statusCallSid = req.body.CallSid;
+    const terminal = resolveTerminalCallOutcome(req.body);
 
-      await updateGHL(
-        "no_answer_voicemail",
-        `Call ended with status: ${callStatus} and duration ${callDuration} seconds.`,
-        phone
-      );
-    } else if (amdVoicemail && callStatus === "completed") {
-      console.log("TRIGGERING GHL UPDATE FOR AMD VOICEMAIL (COMPLETED)");
-
-      await syncTwilioAmdNoAnswerToGhl(
-        req.body.CallSid,
-        answeredByRaw,
+    if (terminal) {
+      await markDialerAttemptTerminal(
+        terminal.outcome,
+        `${terminal.summary} Duration ${callDuration}s.`,
         phone,
-        `Call completed; duration ${callDuration}s.`
+        statusCallSid
       );
+      return res.sendStatus(200);
+    }
+
+    if (callStatus === "completed") {
+      if (amdVoicemail) {
+        logTime("TRIGGERING GHL UPDATE FOR AMD VOICEMAIL (COMPLETED)");
+
+        await markDialerAttemptTerminal(
+          "no_answer_voicemail",
+          `Voicemail/machine detected (AMD). Duration ${callDuration}s.`,
+          phone,
+          statusCallSid
+        );
+        return res.sendStatus(200);
+      }
+
+      requestEndActiveMediaSession("call-status:completed", statusCallSid);
+      // Human-answered: GHL classification runs on stream stop; advance queue only.
+      finishQueueCall(statusCallSid);
     }
 
     res.sendStatus(200);
@@ -708,11 +1224,37 @@ app.post("/call-status", async (req, res) => {
   }
 });
 
-app.post("/amd-status", (req, res) => {
+app.post("/amd-status", async (req, res) => {
+  try {
+    const answeredByRaw = req.body.AnsweredBy || "";
+    const callSid = req.body.CallSid;
 
-  console.log("AMD STATUS:", req.body);
+    logTime("AMD STATUS:", req.body);
 
-  res.sendStatus(200);
+    if (callSid && isTwilioAmdMachineOrFax(answeredByRaw)) {
+      logTime("ASYNC AMD VOICEMAIL — ending call:", callSid);
+
+      const phone = resolveOutboundLeadPhone(req);
+
+      await syncTwilioAmdNoAnswerToGhl(
+        callSid,
+        answeredByRaw,
+        phone,
+        "Async AMD detected machine after connect."
+      ).catch((err) => {
+        console.error("GHL UPDATE (async AMD):", err);
+      });
+
+      await twilioClient.calls(callSid).update({ status: "completed" });
+      requestEndActiveMediaSession("amd-status", callSid);
+      finishQueueCall(callSid);
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("AMD STATUS ERROR:", err);
+    res.sendStatus(500);
+  }
 });
 
 app.post("/recording", async (req, res) => {
@@ -729,9 +1271,9 @@ app.post("/recording", async (req, res) => {
       req.body.From ||
       currentCallLead.phone;
 
-    console.log("Recording ready:", recordingUrl);
-    console.log("Call SID:", callSid);
-    console.log("PHONE:", phone);
+    logTime("Recording ready:", recordingUrl);
+    logTime("Call SID:", callSid);
+    logTime("PHONE:", phone);
 
     const upsertUrl = buildGhlContactsUpsertUrl(phone);
     if (!upsertUrl) {
@@ -767,7 +1309,7 @@ app.post("/recording", async (req, res) => {
 
     const data = await response.json();
 
-    console.log("GHL RECORDING UPDATE:", JSON.stringify(data, null, 2));
+    logTime("GHL RECORDING UPDATE:", JSON.stringify(data, null, 2));
 
     res.sendStatus(200);
   } catch (err) {
@@ -778,120 +1320,354 @@ app.post("/recording", async (req, res) => {
   }
 });
 
-app.post("/start-call", async (req, res) => {
+app.all("/start-dialer", async (req, res) => {
+  dialerRunning = true;
+
+  if (!activeCall) {
+    console.log("Dialer started/restarted. Kicking queue.");
+    if (dialerKickTimer) clearTimeout(dialerKickTimer);
+    dialerKickTimer = setTimeout(() => {
+      dialerKickTimer = null;
+      startNextQueuedLead();
+    }, 1000);
+  } else {
+    console.log("Dialer running. Current call still active.");
+  }
+
+  res.json({
+    success: true,
+    message: "Dialer running",
+    activeCall,
+  });
+});
+
+app.all("/stop-dialer", async (req, res) => {
+  dialerRunning = false;
+
+  console.log("Dialer paused.");
+
+  const hangupSids = new Set([
+    ...mediaSessionsByCallSid.keys(),
+    ...(activeCallSid ? [activeCallSid] : []),
+  ]);
+
+  requestEndAllMediaSessions("stop-dialer");
+
+  for (const sid of hangupSids) {
+    try {
+      await twilioClient.calls(sid).update({ status: "completed" });
+    } catch (err) {
+      console.error("STOP DIALER HANGUP ERROR:", sid, err);
+    }
+  }
+
+  finishQueueCall(activeCallSid);
+
+  res.json({
+    success: true,
+    message: "Dialer will stop after current call",
+    activeCall,
+  });
+});
+
+let pipelineCache = null;
+
+async function ghlRequest(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${process.env.GHL_API_KEY}`,
+      Version: "2021-07-28",
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(`GHL API error ${response.status}: ${JSON.stringify(data)}`);
+  }
+
+  return data;
+}
+
+async function getPipelineStages() {
+  if (pipelineCache) return pipelineCache;
+
+  const url = new URL("https://services.leadconnectorhq.com/opportunities/pipelines");
+  url.searchParams.set("locationId", process.env.GHL_LOCATION_ID);
+
+  const data = await ghlRequest(url.toString(), { method: "GET" });
+
+  const pipelines = data.pipelines || [];
+  const pipeline = pipelines.find(p => p.id === process.env.GHL_PIPELINE_ID);
+
+  if (!pipeline) {
+    throw new Error("Pipeline not found. Check GHL_PIPELINE_ID.");
+  }
+
+  pipelineCache = pipeline.stages || [];
+  return pipelineCache;
+}
+
+async function getStageIdByName(stageName) {
+  const stages = await getPipelineStages();
+
+  const stage = stages.find(
+    s => String(s.name || "").trim().toLowerCase() === stageName.toLowerCase()
+  );
+
+  if (!stage) {
+    throw new Error(`Stage not found: ${stageName}`);
+  }
+
+  return stage.id;
+}
+
+async function getNextOpportunityFromStage(stageName) {
+  const stageId = await getStageIdByName(stageName);
+
+  const url = new URL("https://services.leadconnectorhq.com/opportunities/search");
+  url.searchParams.set("location_id", process.env.GHL_LOCATION_ID);
+  url.searchParams.set("pipeline_id", process.env.GHL_PIPELINE_ID);
+  url.searchParams.set("pipeline_stage_id", stageId);
+  url.searchParams.set("status", "open");
+  url.searchParams.set("limit", "1");
+
+  const data = await ghlRequest(url.toString(), { method: "GET" });
+
+  return data.opportunities?.[0] || null;
+}
+
+async function getContactById(contactId) {
+  return ghlRequest(
+    `https://services.leadconnectorhq.com/contacts/${contactId}`,
+    { method: "GET" }
+  );
+}
+
+async function startNextQueuedLead() {
+  if (!dialerRunning) return;
+  if (activeCall || placingOutboundCall) return;
+
+  activeCall = true;
+
   try {
+    const queueStage = process.env.GHL_QUEUE_STAGE_NAME || "New Lead";
+    let skipAttempts = 0;
+    const maxSkipAttempts = 15;
 
-    console.log( "RAW GHL BODY:", JSON.stringify(req.body, null, 2) );
-    
-    const body = req.body || {};
+    while (skipAttempts < maxSkipAttempts) {
+      const nextOpp = await getNextOpportunityFromStage(queueStage);
 
-const first_name = body.first_name || body.firstName || "";
-const last_name = body.last_name || body.lastName || "";
-const full_name = body.full_name || body.fullName || body.name || "";
-const phone = body.phone || "";
+      if (!nextOpp) {
+        console.log("No queued GHL opportunities left. Dialer stopped.");
+        dialerRunning = false;
+        activeCall = false;
+        return;
+      }
 
-const property_address =
-  body.property_address ||
-  body.propertyAddress ||
-  body["Property Address"] ||
-  body.address ||
-  body.streetAddress ||
-  "";
+      const oppId = nextOpp.id;
+      if (oppId && skippedOpportunityIds.has(oppId)) {
+        skipAttempts++;
+        logTime("Skipping opportunity (could not move stage earlier):", oppId);
+        continue;
+      }
 
-const city = body.city || "";
-const state = body.state || "";
-const postal_code = body.postal_code || body.postalCode || body.zip || "";
+      const contactId = nextOpp.contactId || nextOpp.contact?.id;
+      if (!contactId) {
+        throw new Error("Opportunity has no contactId.");
+      }
 
-const bed = body.bed || body.beds || body["Bed"] || "";
-const bath = body.bath || body.baths || body["Bath"] || "";
-const sq_ft = body.sq_ft || body.sqFt || body["Sq Ft"] || "";
+      currentQueuedOpportunityId = oppId || null;
+      queuedOpportunityReleased = false;
 
-const estimated_value =
-  body.estimated_value ||
-  body.estimatedValue ||
-  body["Estimated Value"] ||
-  "";
+      const contactData = await getContactById(contactId);
+      const contact = contactData.contact || contactData;
 
-const year_built =
-  body.year_built ||
-  body.yearBuilt ||
-  body["Year Built"] ||
-  "";
+      const nextLead = {
+        first_name: contact.firstName || contact.first_name || "",
+        last_name: contact.lastName || contact.last_name || "",
+        full_name: contact.name || contact.fullName || "",
+        phone: contact.phone || "",
+        city: contact.city || "",
+        state: contact.state || "",
+        postal_code: contact.postalCode || contact.postal_code || "",
+        property_address: resolvePropertyAddressFromGhlContact(contact),
+      };
 
-const sale_price =
-  body.sale_price ||
-  body.salePrice ||
-  body["Sale Price"] ||
-  "";
+      console.log("Starting next GHL queued lead:", nextLead.phone);
+      await startCallFromLead(nextLead);
+      return;
+    }
 
-const last_sold =
-  body.last_sold ||
-  body.lastSold ||
-  body["Last Sold"] ||
-  "";
+    console.error(
+      "Dialer paused: too many opportunities could not be advanced out of queue stage."
+    );
+    dialerRunning = false;
+    activeCall = false;
+  } catch (err) {
+    console.error("GHL QUEUE ERROR:", err);
+    activeCall = false;
+    activeCallSid = null;
 
-const call_notes =
-  body.call_notes ||
-  body.callNotes ||
-  "";
+    const phone = currentCallLead?.phone;
+    const outcome = /phone|e\.164|invalid/i.test(String(err.message))
+      ? "wrong_number"
+      : "no_answer_voicemail";
 
-    const cleanPhone = String(phone || "").trim();
+    if (phone) {
+      pendingQueueReleaseOutcome = outcome;
+      await updateGHL(outcome, String(err.message), phone);
+    }
 
-currentCallLead = {
-  first_name:
-    first_name ||
-    full_name?.split(" ")[0] ||
-    "there",
+    void releaseQueuedOpportunityAfterCall().finally(() => {
+      if (dialerRunning) {
+        setTimeout(startNextQueuedLead, 2000);
+      }
+    });
+  }
+}
 
-  last_name: last_name || "",
-  phone: cleanPhone,
+async function startCallFromLead(body) {
+  if (placingOutboundCall) {
+    throw new Error("Outbound call already being placed");
+  }
 
-  address: property_address || "your property",
-  city,
-  state,
-  postal_code,
+  placingOutboundCall = true;
 
-  bed,
-  bath,
-  sq_ft,
-  estimated_value,
-  year_built,
-  sale_price,
-  last_sold,
-  call_notes,
-};
+  try {
+    callStartTime = Date.now();
+    lastWordEmitTime = null;
 
-    console.log("GHL WEBHOOK HIT:", currentCallLead);
+    body = body || {};
+
+    logTime("RAW GHL BODY:", JSON.stringify(body, null, 2));
+
+    const first_name = body.first_name || body.firstName || "";
+    const last_name = body.last_name || body.lastName || "";
+    const full_name = body.full_name || body.fullName || body.name || "";
+    const phone = body.phone || "";
+
+    const property_address = resolvePropertyAddressFromLeadPayload(body);
+
+    const city = body.city || "";
+    const state = body.state || "";
+    const postal_code = body.postal_code || body.postalCode || body.zip || "";
+
+    const bed = body.bed || body.beds || body["Bed"] || "";
+    const bath = body.bath || body.baths || body["Bath"] || "";
+    const sq_ft = body.sq_ft || body.sqFt || body["Sq Ft"] || "";
+
+    const estimated_value =
+      body.estimated_value ||
+      body.estimatedValue ||
+      body["Estimated Value"] ||
+      "";
+
+    const year_built =
+      body.year_built ||
+      body.yearBuilt ||
+      body["Year Built"] ||
+      "";
+
+    const sale_price =
+      body.sale_price ||
+      body.salePrice ||
+      body["Sale Price"] ||
+      "";
+
+    const last_sold =
+      body.last_sold ||
+      body.lastSold ||
+      body["Last Sold"] ||
+      "";
+
+    const call_notes = body.call_notes || body.callNotes || "";
+
+    const cleanPhone = normalizeOutboundPhoneE164(phone);
+    if (!isCallableE164(cleanPhone)) {
+      throw new Error(`Invalid phone number (E.164 required): ${phone}`);
+    }
+
+    currentCallLead = {
+      first_name:
+        first_name ||
+        full_name?.split(" ")[0] ||
+        "there",
+      last_name: last_name || "",
+      phone: cleanPhone,
+      address: property_address || "your property",
+      city: city || "",
+      state: state || "",
+      postal_code: postal_code || "",
+      bed: bed || "",
+      bath: bath || "",
+      sq_ft: sq_ft || "",
+      estimated_value: estimated_value || "",
+      year_built: year_built || "",
+      sale_price: sale_price || "",
+      last_sold: last_sold || "",
+      call_notes: call_notes || "",
+    };
+
+    logTime("GHL WEBHOOK HIT:", currentCallLead);
 
     if (!cleanPhone) {
-      return res.status(400).json({
+      throw new Error("Missing phone number");
+    }
+
+    const publicBaseUrl = process.env.PUBLIC_BASE_URL?.replace(/\/$/, "");
+
+    if (!publicBaseUrl) {
+      throw new Error("Missing PUBLIC_BASE_URL");
+    }
+
+    const call = await twilioClient.calls.create({
+      to: cleanPhone,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      url: `${publicBaseUrl}/voice`,
+      machineDetection: "Enable",
+      asyncAmd: true,
+      asyncAmdStatusCallback: `${publicBaseUrl}/amd-status`,
+      asyncAmdStatusCallbackMethod: "POST",
+      statusCallback: `${publicBaseUrl}/call-status`,
+      statusCallbackEvent: ["initiated", "completed"],
+      record: true,
+      recordingChannels: "dual",
+      recordingStatusCallback: `${publicBaseUrl}/recording`,
+      recordingStatusCallbackEvent: ["completed"],
+    });
+
+    callSidToLeadPhone.set(call.sid, cleanPhone);
+    activeCallSid = call.sid;
+
+    logTime("OUTBOUND CALL STARTED:", call.sid);
+
+    return call;
+  } catch (err) {
+    activeCall = false;
+    activeCallSid = null;
+    console.error("START CALL ERROR:", err);
+    throw err;
+  } finally {
+    placingOutboundCall = false;
+  }
+}
+
+app.post("/start-call", async (req, res) => {
+  try {
+    if (activeCall) {
+      return res.status(409).json({
         success: false,
-        error: "Missing phone number",
+        error: "Call already active",
       });
     }
 
-    const publicBaseUrl =
-      process.env.PUBLIC_BASE_URL?.replace(/\/$/, "") ||
-      `https://${req.headers.host}`;
+    activeCall = true;
 
-    const call = await twilioClient.calls.create({
-  to: cleanPhone,
-  from: process.env.TWILIO_PHONE_NUMBER,
-  url: `${publicBaseUrl}/voice`,
-      
-      machineDetection: "Enable",
-      
-  statusCallback: `${publicBaseUrl}/call-status`,
-  statusCallbackEvent: ["completed", "no-answer", "busy",  "failed"],
-  record: true,
-  recordingChannels: "dual",
-  recordingStatusCallback: `${publicBaseUrl}/recording`,
-  recordingStatusCallbackEvent: ["completed"],
-});
-
-    callSidToLeadPhone.set(call.sid, cleanPhone);
-
-    console.log("OUTBOUND CALL STARTED:", call.sid);
+    const call = await startCallFromLead(req.body);
 
     res.status(200).json({
       success: true,
@@ -899,7 +1675,11 @@ currentCallLead = {
       callSid: call.sid,
     });
   } catch (err) {
+    activeCall = false;
+    activeCallSid = null;
+
     console.error("START CALL ERROR:", err);
+
     res.status(500).json({
       success: false,
       error: err.message,
@@ -908,38 +1688,229 @@ currentCallLead = {
 });
 
 wss.on("connection", (twilioWs) => {
-  console.log("Twilio websocket connected");
+  if (mediaSessionsByCallSid.size > 0) {
+    logTime(
+      "Duplicate media stream blocked — tearing down",
+      mediaSessionsByCallSid.size,
+      "existing session(s)"
+    );
+    requestEndAllMediaSessions("duplicate-media-stream");
+  }
+
+  if (callStartTime == null) {
+    callStartTime = Date.now();
+  }
+
+  logTime("Twilio websocket connected");
 
   const openerSpeech = buildOpenerSpeechContext(currentCallLead);
-  console.log("SPOKEN OPENER CONTEXT:", openerSpeech);
+  logTime("SPOKEN OPENER CONTEXT:", openerSpeech);
+
+let firstDeltaReceived = false;
+let firstTextToEleven = false;
+let firstElevenAudio = false;
+let firstTwilioAudio = false;
 
   let streamSid = null;
   let callSid = null;
   let latestMediaTimestamp = 0;
-  let responseStartTimestamp = null;
-  let lastAssistantItem = null;
   let fullCallTranscript = "";
   let callState = CALL_STATE.IDLE;
-  let assistantTextBuffer = "";
   let elevenWs = null;
+  let elevenKeepAlive = null;
+  let mediaSessionEnded = false;
+  let callAfterMediaFinalized = false;
+
+  async function finalizeCallAfterMediaEnd(source) {
+    if (callAfterMediaFinalized) return;
+    callAfterMediaFinalized = true;
+
+    const wrongNumberAlreadyHandled =
+      callState === CALL_STATE.WRONG_NUMBER;
+
+    if (callState !== CALL_STATE.ENDED) {
+      callState = CALL_STATE.ENDED;
+    }
+
+    logTime("Finalizing call after media end:", source, callSid);
+
+    if (callSid) {
+      const summaryPrompt = `
+Summarize this real estate call in ONE short line.
+
+Interest level MUST be one of:
+- interested
+- not interested
+- follow up
+- no answer
+
+Format exactly like this:
+interest: [one of the four], condition: [if mentioned], timeline: [if mentioned], price: [if mentioned]
+
+Keep it very short. No extra words.
+
+Call:
+${fullCallTranscript}
+`;
+
+      let summary = "";
+
+      try {
+        const res = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [
+              {
+                role: "system",
+                content: "Only output the formatted call summary line.",
+              },
+              { role: "user", content: summaryPrompt },
+            ],
+          }),
+        });
+
+        const data = await res.json();
+        summary = data.choices?.[0]?.message?.content || "";
+      } catch (err) {
+        console.error("Summary error:", err);
+      }
+
+      callNotesBySid[callSid] = {
+        summary,
+        transcript: fullCallTranscript,
+        endedAt: new Date().toISOString(),
+      };
+
+      logTime("CALL SUMMARY:", summary);
+    }
+
+    const terminalStatusAlreadyHandled =
+      callSid && callSidTerminalStatusHandled.has(callSid);
+
+    if (wrongNumberAlreadyHandled) {
+      logTime(
+        "Skipping final classification because wrong number was already detected."
+      );
+      pendingQueueReleaseOutcome = "wrong_number";
+      finishQueueCall(callSid);
+    } else if (terminalStatusAlreadyHandled) {
+      logTime(
+        "Skipping stream-stop GHL update — terminal call-status already handled."
+      );
+      finishQueueCall(callSid);
+    } else if (!sellerUtteranceDetected) {
+      updateGHL(
+        "no_answer_voicemail",
+        "No answer or voicemail reached. No meaningful seller response.",
+        currentCallLead.phone
+      ).finally(() => {
+        pendingQueueReleaseOutcome = "no_answer_voicemail";
+        finishQueueCall(callSid);
+      });
+    } else if (!fullTranscript || fullTranscript.length < 10) {
+      updateGHL(
+        "follow_up",
+        "Seller answered but hung up before a full conversation.",
+        currentCallLead.phone
+      ).finally(() => {
+        pendingQueueReleaseOutcome = "follow_up";
+        finishQueueCall(callSid);
+      });
+    } else {
+      classifyCall(fullTranscript).then((result) => {
+        updateGHL(
+          result.ai_call_outcome,
+          result.call_summary,
+          currentCallLead.phone
+        ).finally(() => {
+          pendingQueueReleaseOutcome = result.ai_call_outcome;
+          finishQueueCall(callSid);
+        });
+      });
+    }
+  }
+
+  function teardownMediaSession(reason) {
+    if (mediaSessionEnded) return;
+    mediaSessionEnded = true;
+
+    if (callSid) {
+      mediaSessionsByCallSid.delete(callSid);
+    }
+
+    if (endActiveMediaSession === teardownMediaSession) {
+      endActiveMediaSession = null;
+    }
+
+    clearInterval(elevenKeepAlive);
+    elevenKeepAlive = null;
+
+    if (openerPlaybackEndTimer) {
+      clearTimeout(openerPlaybackEndTimer);
+      openerPlaybackEndTimer = null;
+    }
+
+    if (assistantPlaybackTimer) {
+      clearTimeout(assistantPlaybackTimer);
+      assistantPlaybackTimer = null;
+    }
+
+    if (elevenWs?.readyState === WebSocket.OPEN) {
+      elevenWs.close();
+    }
+
+    if (openAiWs?.readyState === WebSocket.OPEN) {
+      openAiWs.close();
+    }
+
+    if (twilioWs?.readyState === WebSocket.OPEN) {
+      twilioWs.close();
+    }
+
+    logTime("Media session torn down:", reason);
+  }
+
+  endActiveMediaSession = teardownMediaSession;
+
+function startElevenKeepAlive(ws) {
+  clearInterval(elevenKeepAlive);
+
+  elevenKeepAlive = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        text: " ",
+      }));
+
+      logTime("ELEVEN KEEPALIVE");
+    }
+  }, 12000);
+}
   let elevenBuffer = "";
-  let aiSpeaking = false;
-  let aiSpeechTimeout = null;
+  const wordTelemetry = createWordDeltaTracker();
+  let lastSellerTranscript = "";
+  let directOpenerPlayed = false;
+  let openerPlaybackEndTimer = null;
   /** Post-opener seller lines appended to fullTranscript for classification. */
   let sellerEngagedPostOpener = false;
   /** Any completed seller transcription (legacy sellerSpoke semantics for CRM). */
   let sellerUtteranceDetected = false;
   let hangupTaskScheduled = false;
-  /** True from `response.create` for the opener until `response.done` for that response. */
-  let openerInProgress = false;
+  /** Full assistant text for the in-flight response (deltas + final flush). */
+  let assistantTurnText = "";
   let sellerAudioEnabled = false;
   let machineScore = 0;
   /** Twilio often sends `start` after OpenAI already streams opener audio — buffer until `streamSid` exists. */
   const pendingTwilioMediaPayloads = [];
   const MAX_PENDING_MEDIA_CHUNKS = 4000;
-  let openerResponseSent = false;
-  let openerFallbackTimer = null;
   let responseInProgress = false;
+  /** Block new seller turns until estimated assistant audio finishes. */
+  let assistantPlaybackUntil = 0;
+  let assistantPlaybackTimer = null;
 
   const openAiWs = new WebSocket(
   "wss://api.openai.com/v1/realtime?model=gpt-realtime-2",
@@ -950,56 +1921,149 @@ wss.on("connection", (twilioWs) => {
   }
 );
 
- function shouldEndCall(text) {
-  const t = String(text || "").toLowerCase();
+function shouldEndCall(text) {
+  const t = normalizeApostrophes(text).toLowerCase().trim();
+  if (!t) return false;
 
   const hardGoodbye =
     t.includes("have a good one") ||
     t.includes("have a good day") ||
+    t.includes("have a great day") ||
     t.includes("talk soon") ||
+    t.includes("talk to you later") ||
+    t.includes("see you later") ||
     t.includes("take care") ||
-    t.includes("bye");
+    /\bbye\b/.test(t) ||
+    t.includes("goodbye");
 
   const clearClose =
-    t.includes("i’ll give you a call back") ||
-    t.includes("i’ll follow up with you") ||
-    t.includes("i’ll circle back with you");
+    t.includes("i'll give you a call back") ||
+    t.includes("ill give you a call back") ||
+    t.includes("i'll follow up with you") ||
+    t.includes("ill follow up with you") ||
+    t.includes("i'll circle back") ||
+    t.includes("ill circle back") ||
+    t.includes("i'll circle around") ||
+    t.includes("ill circle around") ||
+    t.includes("circle back after") ||
+    t.includes("take a look at everything");
 
   return hardGoodbye || clearClose;
 }
 
+function extractAssistantTextFromResponse(event) {
+  const fromOutput =
+    event?.response?.output
+      ?.flatMap((item) => item.content || [])
+      ?.map((part) => part.text || part.transcript || "")
+      .join(" ")
+      .trim() || "";
+
+  if (fromOutput) return fromOutput;
+
+  const fromOutputText = String(event?.response?.output_text || "").trim();
+  return fromOutputText;
+}
+
+function maybeScheduleFarewellHangup(text, source) {
+  if (!shouldEndCall(text)) return false;
+  scheduleEndCall(`${source}: ${text.slice(0, 120)}`);
+  return true;
+}
+
 async function classifyCall(transcript) {
   try {
-  if (!transcript || transcript.trim().length < 10) {
-  return {
-    ai_call_outcome: "no_answer_voicemail",
-    call_summary: "No answer or voicemail reached.",
-  };
-}
+    const text = String(transcript || "").toLowerCase();
 
-const lowerTranscript = transcript.toLowerCase();
+    if (!transcript || transcript.trim().length < 10) {
+      return {
+        ai_call_outcome: "follow_up",
+        call_summary: "Seller answered but the conversation was too short to classify clearly.",
+      };
+    }
 
-const rejectionPhrases = [
-  "not interested",
-  "no thanks",
-  "i'm good",
-  "im good",
-  "stop calling",
-  "remove me",
-  "take me off",
-  "don't call",
-  "do not call",
-  "not selling",
-  "already sold",
-];
+    const wrongNumberPhrases = [
+      "wrong number",
+      "you have the wrong number",
+      "not my property",
+      "i don't own that",
+      "i dont own that",
+      "who is this for",
+    ];
 
-if (rejectionPhrases.some((phrase) => lowerTranscript.includes(phrase))) {
-  return {
-    ai_call_outcome: "not_interested",
-    call_summary: "Seller clearly rejected the call or said they are not interested.",
-  };
-}
-    
+    if (wrongNumberPhrases.some((p) => text.includes(p))) {
+      return {
+        ai_call_outcome: "wrong_number",
+        call_summary: "Person indicated this is the wrong number or they do not own the property.",
+      };
+    }
+
+    const notInterestedPhrases = [
+      "not interested",
+      "no thanks",
+      "i'm good",
+      "im good",
+      "stop calling",
+      "remove me",
+      "take me off",
+      "don't call",
+      "do not call",
+      "not selling",
+      "already sold",
+    ];
+
+    if (notInterestedPhrases.some((p) => text.includes(p))) {
+      return {
+        ai_call_outcome: "not_interested",
+        call_summary: "Seller clearly rejected the call or said they are not interested.",
+      };
+    }
+
+    const interestedPhrases = [
+      "what would you offer",
+      "make me an offer",
+      "send me an offer",
+      "how much",
+      "what's your offer",
+      "whats your offer",
+      "i would sell",
+      "i'd sell",
+      "i am interested",
+      "i'm interested",
+      "possibly selling",
+      "open to selling",
+      "yes i'm open",
+      "yes im open",
+    ];
+
+    if (interestedPhrases.some((p) => text.includes(p))) {
+      return {
+        ai_call_outcome: "interested",
+        call_summary: "Seller showed interest in selling or asked about an offer/next steps.",
+      };
+    }
+
+    const followUpPhrases = [
+      "call me back",
+      "call back",
+      "follow up",
+      "later",
+      "not right now",
+      "maybe",
+      "send me more information",
+      "i need to think",
+      "talk another time",
+      "busy",
+      "at work",
+    ];
+
+    if (followUpPhrases.some((p) => text.includes(p))) {
+      return {
+        ai_call_outcome: "follow_up",
+        call_summary: "Seller answered and requested follow up or seemed unsure.",
+      };
+    }
+
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -1015,25 +2079,18 @@ if (rejectionPhrases.some((phrase) => lowerTranscript.includes(phrase))) {
             content: `
 You classify real estate seller calls.
 
-Return ONLY valid JSON with:
+Return ONLY valid JSON:
 {
-  "ai_call_outcome": "no_answer_voicemail | follow_up | interested | not_interested",
+  "ai_call_outcome": "follow_up | interested | not_interested | wrong_number",
   "call_summary": "short summary"
 }
 
-Rules:
-- no_answer_voicemail = no meaningful conversation, voicemail, no answer, immediate hangup
-- interested = seller is open to selling, gives price/timeline/condition, wants an offer, asks for next steps
-- not_interested = ANY clear rejection, including:
-  "not interested"
-  "stop calling"
-  "remove me"
-  "already sold"
-  "take me off your list"
-- follow_up = seller is unsure, says maybe later, asks to call back, needs time, or conversation is unclear
-
-CRITICAL:
-If the seller says "not interested" return "not_interested".
+Important:
+- Only classify no answer outside this function. If this function is called, a human likely answered.
+- wrong_number = person says wrong number, not their property, or they do not own it.
+- interested = seller is open to selling, asks about price/offer, gives timeline/condition, or wants next steps.
+- not_interested = seller clearly rejects, says not interested, stop calling, remove me, already sold, or not selling.
+- follow_up = seller is unsure, busy, says maybe later, asks to call back, needs time, or conversation is unclear.
 
 If uncertain, choose follow_up.
 `,
@@ -1050,10 +2107,10 @@ If uncertain, choose follow_up.
     const parsed = JSON.parse(data.choices[0].message.content);
 
     const allowed = [
-      "no_answer_voicemail",
       "follow_up",
       "interested",
       "not_interested",
+      "wrong_number",
     ];
 
     if (!allowed.includes(parsed.ai_call_outcome)) {
@@ -1082,25 +2139,32 @@ function scheduleEndCall(reason) {
     callState = CALL_STATE.ENDING;
   }
 
-  console.log("AUTO ENDING CALL:", reason);
+  const playbackRemaining = Math.max(0, assistantPlaybackUntil - Date.now());
+  const delayMs = Math.max(1500, playbackRemaining + 400);
+
+  logTime("AUTO ENDING CALL:", reason, `(delay ${delayMs}ms)`);
 
   setTimeout(async () => {
     try {
-      if (callSid) {
-        console.log("FORCE END CALL:", callSid);
-
-        await twilioClient.calls(callSid).update({
-  status: "completed"
-});
+      if (!callSid) {
+        logTime("FORCE END CALL SKIPPED: missing callSid");
+        hangupTaskScheduled = false;
+        return;
       }
+
+      logTime("FORCE END CALL:", callSid);
+
+      await twilioClient.calls(callSid).update({
+        status: "completed",
+      });
     } catch (err) {
       console.error("FORCE END CALL ERROR:", err);
+      hangupTaskScheduled = false;
     }
-  }, 1500);
+  }, delayMs);
 }
 
  async function sendSessionUpdate() {
-  const openerBlock = buildOutboundOpenerInstructionBlock(openerSpeech);
 
   const leadContext = `
 CURRENT LEAD CONTEXT:
@@ -1124,49 +2188,44 @@ Do NOT read every detail out loud.
 Mention the property address naturally if helpful.
 `;
 
-  console.log("CALL LEAD LOADED FROM GHL:", currentCallLead);
+  logTime("CALL LEAD LOADED FROM GHL:", currentCallLead);
 
+   logTime("SESSION.UPDATE SENT");
  const sessionUpdate = {
+   
   type: "session.update",
   session: {
   type: "realtime",
   output_modalities: ["text"],
 
   instructions:
-    openerBlock +
-    `
-
-` +
     SYSTEM_PROMPT +
     `
 ` +
     leadContext,
 
   audio: {
-    input: {
-      format: {
-        type: "audio/pcmu"
-      },
+  input: {
+    format: {
+      type: "audio/pcmu",
+    },
 
-      turn_detection: {
-        type: "server_vad",
-        threshold: 0.95,
-        prefix_padding_ms: 500,
-        silence_duration_ms: 1000,
-        create_response: false,
-        interrupt_response: true,
-      }
-    }
-  }
- }
-};
+    transcription: {
+      model: "gpt-4o-mini-transcribe",
+    },
 
-   
-console.log(
-  "SESSION UPDATE SENT:",
-  JSON.stringify(sessionUpdate, null, 2)
-);
-
+    turn_detection: {
+      type: "server_vad",
+      threshold: 0.85,
+      prefix_padding_ms: 950,
+      silence_duration_ms: 655,
+      create_response: false,
+      interrupt_response: true,
+    },
+  },
+},
+},
+};   
    
   openAiWs.send(JSON.stringify(sessionUpdate));
 }
@@ -1187,7 +2246,7 @@ console.log(
   function flushPendingAssistantAudioToTwilio() {
     if (!streamSid || pendingTwilioMediaPayloads.length === 0) return;
 
-    console.log(
+    logTime(
       `TWILIO FLUSH: replaying ${pendingTwilioMediaPayloads.length} buffered assistant audio frame(s)`
     );
 
@@ -1203,8 +2262,36 @@ console.log(
     }
   }
 
+  function extendAssistantPlaybackEstimate(base64Payload) {
+    if (!base64Payload) return;
+
+    const bytes = Buffer.from(base64Payload, "base64").length;
+    const durationMs = Math.ceil((bytes / 8000) * 1000) + 250;
+    assistantPlaybackUntil = Math.max(
+      assistantPlaybackUntil,
+      Date.now() + durationMs
+    );
+
+    if (assistantPlaybackTimer) {
+      clearTimeout(assistantPlaybackTimer);
+    }
+
+    assistantPlaybackTimer = setTimeout(() => {
+      assistantPlaybackTimer = null;
+      if (
+        callState === CALL_STATE.RESPONDING &&
+        Date.now() >= assistantPlaybackUntil
+      ) {
+        callState = CALL_STATE.LISTENING;
+        logTime("ASSISTANT PLAYBACK DONE → LISTENING");
+      }
+    }, durationMs + 50);
+  }
+
   function forwardAssistantAudioToTwilio(delta) {
     if (!delta) return;
+
+    extendAssistantPlaybackEstimate(delta);
 
     if (streamSid) {
       twilioWs.send(
@@ -1218,7 +2305,7 @@ console.log(
     }
 
     if (pendingTwilioMediaPayloads.length === 0) {
-      console.log(
+      logTime(
         "TWILIO BUFFER: assistant audio arrived before stream start — buffering until streamSid"
       );
     }
@@ -1231,232 +2318,267 @@ console.log(
     pendingTwilioMediaPayloads.push(delta);
   }
 
-  function sendOpenerResponseOnce(source) {
-    if (openerResponseSent) return;
-    if (openAiWs.readyState !== WebSocket.OPEN) return;
 
-    openerResponseSent = true;
+/** @returns {boolean} whether playback was interrupted */
+function interruptAssistant() {
 
-    if (openerFallbackTimer) {
-      clearTimeout(openerFallbackTimer);
-      openerFallbackTimer = null;
+  callState = CALL_STATE.INTERRUPTING;
+  elevenBuffer = "";
+  wordTelemetry.reset();
+  assistantPlaybackUntil = 0;
+
+  if (assistantPlaybackTimer) {
+    clearTimeout(assistantPlaybackTimer);
+    assistantPlaybackTimer = null;
+  }
+
+  clearTwilioAudio();
+
+
+ if (
+  responseInProgress &&
+  openAiWs.readyState === WebSocket.OPEN
+) {
+  openAiWs.send(
+    JSON.stringify({
+      type: "response.cancel",
+    })
+  );
+}
+
+  return true;
+}
+
+  function sendTextToEleven(ws, rawText, options = {}) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return null;
+
+    const tone =
+      options.tone ||
+      inferElevenTone(callState, lastSellerTranscript, rawText);
+    const shaped = shapeTextForEleven(rawText, tone);
+    if (!shaped) return null;
+
+    // ElevenLabs: voice_settings only on the first WS message — never repeat or change.
+    const payload = { text: shaped };
+
+    if (options.flush !== false) {
+      payload.flush = true;
     }
 
-    console.log("OPENER response.create →", source);
+    ws.send(JSON.stringify(payload));
 
-    openerInProgress = true;
+    if (
+      callState === CALL_STATE.LISTENING ||
+      callState === CALL_STATE.INTERRUPTING
+    ) {
+      callState = CALL_STATE.RESPONDING;
+    }
+
+    return { shaped, tone };
+  }
+
+  function attachElevenLabsHandlers(ws) {
+    ws.on("message", (data) => {
+      try {
+        const audioChunk = JSON.parse(data.toString());
+
+        if (audioChunk.audio) {
+          if (!firstElevenAudio) {
+            firstElevenAudio = true;
+            logTime("FIRST ELEVEN AUDIO RECEIVED");
+          }
+
+          if (!firstTwilioAudio) {
+            firstTwilioAudio = true;
+            logTime("FIRST AUDIO SENT TO TWILIO");
+          }
+
+          if (callState === CALL_STATE.OPENING) {
+            scheduleOpenerPlaybackEnd();
+          }
+
+          forwardAssistantAudioToTwilio(audioChunk.audio);
+        }
+      } catch (err) {
+        console.error("ELEVEN MESSAGE PARSE ERROR:", err);
+      }
+    });
+
+    ws.on("error", (err) => {
+      console.error("ElevenLabs websocket error:", err);
+    });
+
+    ws.on("close", (code, reason) => {
+      clearInterval(elevenKeepAlive);
+      
+      logTime(
+        
+        "ElevenLabs websocket closed",
+        "code:",
+        code,
+        "reason:",
+        reason?.toString?.() || ""
+      );
+    });
+  }
+
+  function scheduleOpenerPlaybackEnd() {
+    if (openerPlaybackEndTimer) {
+      clearTimeout(openerPlaybackEndTimer);
+    }
+
+    openerPlaybackEndTimer = setTimeout(() => {
+      openerPlaybackEndTimer = null;
+      if (callState !== CALL_STATE.OPENING) return;
+
+      callState = CALL_STATE.LISTENING;
+      logTime("DIRECT OPENER PLAYBACK DONE → LISTENING");
+    }, 1200);
+  }
+
+  function seedOpenerInOpenAiConversation(spokenLine) {
+    if (openAiWs.readyState !== WebSocket.OPEN) return;
 
     openAiWs.send(
       JSON.stringify({
-        type: "response.create",
-        response: {
-          instructions: buildOpenerResponseCreateInstructions(openerSpeech),
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: spokenLine }],
         },
       })
     );
   }
 
-  /** @returns {boolean} whether playback was interrupted (Twilio clear / cancel already applied when true) */
-  function interruptAssistant() {
-    if (lastAssistantItem && responseStartTimestamp !== null) {
-      callState = CALL_STATE.INTERRUPTING;
+  function playDirectOpenerToEleven(source) {
+    if (directOpenerPlayed) return;
+    if (!elevenWs || elevenWs.readyState !== WebSocket.OPEN) return;
 
-      const elapsedMs = latestMediaTimestamp - responseStartTimestamp;
+    directOpenerPlayed = true;
+    callState = CALL_STATE.OPENING;
 
-      openAiWs.send(
-        JSON.stringify({
-          type: "conversation.item.truncate",
-          item_id: lastAssistantItem,
-          content_index: 0,
-          audio_end_ms: elapsedMs,
-        })
+    const spokenLine = buildOpenerSpokenLine(openerSpeech);
+
+    logTime(`DIRECT OPENER TTS (${source})`);
+    logTime("DIRECT OPENER TO ELEVEN:", spokenLine);
+
+    sendTextToEleven(elevenWs, spokenLine, { flush: true });
+
+    if (!firstTextToEleven) {
+      firstTextToEleven = true;
+      logTime("FIRST TEXT SENT TO ELEVEN (direct opener)");
+    }
+
+    fullCallTranscript += `ASSISTANT (opener): ${spokenLine}\n`;
+    seedOpenerInOpenAiConversation(spokenLine);
+
+    setTimeout(() => {
+      if (callState === CALL_STATE.OPENING) {
+        callState = CALL_STATE.LISTENING;
+        logTime("OPENER MAX DURATION FALLBACK → LISTENING");
+      }
+    }, 15000);
+  }
+
+  function connectElevenLabs() {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(
+        `wss://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}/stream-input?output_format=ulaw_8000&model_id=eleven_turbo_v2_5`,
+        {
+          headers: {
+            "xi-api-key": process.env.ELEVENLABS_API_KEY,
+          },
+        }
       );
 
-      clearTwilioAudio();
+      ws.on("open", () => {
+        logTime("ELEVENLABS WS OPEN");
 
-      lastAssistantItem = null;
-      responseStartTimestamp = null;
-      return true;
-    }
+      ws.send(
+  JSON.stringify({
+    text: " ",
+    generation_config: {
+      chunk_length_schedule: [120, 160, 220, 290],
+    },
+  })
+);
+        resolve(ws);
+      });
 
-    if (aiSpeaking) {
-      callState = CALL_STATE.INTERRUPTING;
-      clearTwilioAudio();
-      if (aiSpeechTimeout) {
-        clearTimeout(aiSpeechTimeout);
-        aiSpeechTimeout = null;
-      }
-      aiSpeaking = false;
-      if (openAiWs.readyState === WebSocket.OPEN) {
-        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-      }
-      return true;
-    }
-
-    return false;
+      ws.on("error", reject);
+    });
   }
 
 openAiWs.on("open", async () => {
-  console.log("Connected to OpenAI Realtime");
-
+  logTime("OPENAI WS OPEN");
   callState = CALL_STATE.OPENING;
-elevenWs = new WebSocket(
-  `wss://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}/stream-input?output_format=ulaw_8000&model_id=eleven_flash_v2_5`,
-  {
-    headers: {
-      "xi-api-key": process.env.ELEVENLABS_API_KEY,
-    },
-  }
-);
-
-elevenWs.on("open", () => {
-  console.log("Connected to ElevenLabs");
-  
-  elevenWs.send(JSON.stringify({
-  text: " ",
-  voice_settings: {
-    stability: 0.45,
-    similarity_boost: 0.85,
-    style: 0.2,
-    use_speaker_boost: true
-  }
-}));
-});
-
-elevenWs.on("message", (data) => {
-
-  console.log("RAW ELEVEN MESSAGE:", data.toString());
 
   try {
-
-    const audioChunk = JSON.parse(data.toString());
-
-    console.log("PARSED ELEVEN MESSAGE:", audioChunk);
-
-    if (audioChunk.audio) {
-
-      console.log("ELEVEN AUDIO RECEIVED");
-
-      aiSpeaking = true;
-
-      clearTimeout(aiSpeechTimeout);
-
-      aiSpeechTimeout = setTimeout(() => {
-
-        aiSpeaking = false;
-
-        console.log("AI SPEAKING ENDED");
-
-      }, 1400);
-
-      console.log("FORWARDING AUDIO TO TWILIO");
-
-      forwardAssistantAudioToTwilio(audioChunk.audio);
-
-    } else {
-
-      console.log("NO AUDIO FIELD FOUND");
-
-    }
-
+    elevenWs = await connectElevenLabs();
+    attachElevenLabsHandlers(elevenWs);
+    startElevenKeepAlive(elevenWs);
+    
   } catch (err) {
-
-    console.error("ELEVEN MESSAGE PARSE ERROR:", err);
-
+    console.error("ElevenLabs connection failed:", err);
+    return;
   }
 
-});
-
-elevenWs.on("error", (err) => {
-  console.error("ElevenLabs websocket error:", err);
-});
-
-elevenWs.on("close", (code, reason) => {
-  console.log(
-    "ElevenLabs websocket closed",
-    "code:",
-    code,
-    "reason:",
-    reason?.toString?.() || ""
-  );
-});
-  
   await sendSessionUpdate();
 
-  setTimeout(() => {
-    sendOpenerResponseOnce("post_session_update_tick");
-  }, 200);
-
-  openerFallbackTimer = setTimeout(() => {
-    openerFallbackTimer = null;
-    sendOpenerResponseOnce("fallback_opener");
-  }, 1600);
-  });
-
+  playDirectOpenerToEleven("post_session_update");
+});
+  
 let fullTranscript = ""; 
 
 openAiWs.on("message", async (data) => {
   try {
     const event = JSON.parse(data.toString());
-    console.log("OPENAI EVENT:", event.type);
     
 if (
-  event.type === "response.text.delta" ||
-  event.type === "response.output_text.delta"
+  event.type === "response.output_text.delta" ||
+  event.type === "response.text.delta"
 ) {
+
+  if (!firstDeltaReceived) {
+    firstDeltaReceived = true;
+    logTime("FIRST OPENAI TEXT DELTA");
+  }
+
   const delta = event.delta ?? "";
 
-  assistantTextBuffer += delta;
+  wordTelemetry.feed(delta);
+
+  if (callState === CALL_STATE.OPENING) {
+    return;
+  }
+
+  assistantTurnText += delta;
+  maybeScheduleFarewellHangup(assistantTurnText, "streamed farewell");
 
   elevenBuffer += delta;
 
-  console.log("AI TEXT DELTA:", delta);
-
-  const shouldFlush =
-    elevenBuffer.includes(".") ||
-    elevenBuffer.includes("?") ||
-    elevenBuffer.includes("!") ||
-    elevenBuffer.length > 120;
+  const shouldFlush = shouldFlushElevenBuffer(elevenBuffer);
 
   if (
     shouldFlush &&
     elevenWs &&
     elevenWs.readyState === WebSocket.OPEN
   ) {
+    
+    if (!firstTextToEleven) {
+  firstTextToEleven = true;
+  logTime("FIRST TEXT SENT TO ELEVEN");
+}
 
-    elevenWs.send(JSON.stringify({
-     text: elevenBuffer,
-flush: true
-    }));
-
-    console.log("SENT TO ELEVEN:", elevenBuffer);
+    const sent = sendTextToEleven(elevenWs, elevenBuffer, { flush: true });
+    if (sent) {
+      logTime("SENT TO ELEVEN:", sent.shaped, `(tone: ${sent.tone})`);
+    }
 
     elevenBuffer = "";
   }
 
-}
-  
-    
-    if (event.type === "response.output_audio.delta") {
-
-  console.log("AUDIO DELTA RECEIVED");
-
-  if (event.item_id) {
-    lastAssistantItem = event.item_id;
-  }
-
-  if (
-    callState === CALL_STATE.LISTENING ||
-    callState === CALL_STATE.INTERRUPTING
-  ) {
-    callState = CALL_STATE.RESPONDING;
-  }
-
-  if (!responseStartTimestamp) {
-    responseStartTimestamp = latestMediaTimestamp;
-  }
-
-  forwardAssistantAudioToTwilio(event.delta);
 }
 
     if (event.type === "conversation.item.created") {
@@ -1466,7 +2588,7 @@ flush: true
         const userText = item.content?.[0]?.transcript?.trim();
 
         if (userText) {
-          console.log("USER SAID:", userText);
+          logTime("USER SAID:", userText);
           fullCallTranscript += `USER: ${userText}\n`;
         }
       }
@@ -1477,39 +2599,32 @@ if (event.type === "conversation.item.input_audio_transcription.completed") {
   sellerUtteranceDetected = true;
 
   const transcript = (event.transcript || "").trim();
+  if (transcript) {
+    lastSellerTranscript = transcript;
+  }
   const lowerTranscript = transcript.toLowerCase();
 
   if (detectMachineTranscript(lowerTranscript)) {
 
     machineScore += 3;
 
-    console.log("MACHINE PHRASE DETECTED");
+    logTime("MACHINE PHRASE DETECTED");
   }
-
-  if (transcript.length > 200) {
-
-    machineScore += 1;
-  }
-
-  console.log("MACHINE SCORE:", machineScore);
+  
+  logTime("MACHINE SCORE:", machineScore);
 
   if (machineScore >= 3) {
 
-    console.log("VOICEMAIL / IVR DETECTED");
+    logTime("VOICEMAIL / IVR DETECTED");
 
     callState = CALL_STATE.VOICEMAIL;
-
-    openerInProgress = false;
 
     fullTranscript += `\nVOICEMAIL: ${transcript}`;
     fullCallTranscript += `VOICEMAIL: ${transcript}\n`;
 
    interruptAssistant();
 
-    openAiWs.send(JSON.stringify({
-      type: "response.cancel"
-    }));
-
+  
     clearTwilioAudio();
 
     try {
@@ -1518,7 +2633,7 @@ if (event.type === "conversation.item.input_audio_transcription.completed") {
   status: "completed"
 });
 
-      console.log("VOICEMAIL CALL ENDED");
+      logTime("VOICEMAIL CALL ENDED");
 
     } catch (err) {
 
@@ -1531,7 +2646,7 @@ if (event.type === "conversation.item.input_audio_transcription.completed") {
 
   // rest of your existing logic below
 
-console.log("SELLER SAID:", transcript);
+logTime("SELLER SAID:", transcript);
 
 
 
@@ -1556,16 +2671,14 @@ console.log("SELLER SAID:", transcript);
   );
 
   if (isWrongNumber) {
-    console.log("WRONG NUMBER DETECTED");
+    logTime("WRONG NUMBER DETECTED");
 
     callState = CALL_STATE.WRONG_NUMBER;
-    openerInProgress = false;
-
     fullTranscript += `\nWRONG NUMBER: ${transcript}`;
     fullCallTranscript += `WRONG NUMBER: ${transcript}\n`;
 
     updateGHL(
-      "ai_wrong_number",
+      "wrong_number",
       "Contact stated this is a wrong number.",
       currentCallLead.phone
     );
@@ -1587,7 +2700,7 @@ console.log("SELLER SAID:", transcript);
     callState === CALL_STATE.INTERRUPTING;
 
   if (!realtimeConversation) {
-    console.log("SELLER SPEECH DURING OPENER — deferred until LISTENING");
+    logTime("SELLER SPEECH DURING OPENER — deferred until LISTENING");
     fullCallTranscript += `SELLER (during opener): ${transcript}\n`;
     return;
   }
@@ -1602,14 +2715,14 @@ fullCallTranscript += `SELLER: ${transcript}\n`;
 
     // user starts speaking → stop any current playback (realtime mode only)
     if (event.type === "input_audio_buffer.speech_started") {
-      console.log("Possible user speech detected");
+      logTime("Possible user speech detected");
 
       const canInterrupt =
         callState === CALL_STATE.LISTENING ||
         callState === CALL_STATE.RESPONDING;
 
       if (!canInterrupt) {
-        console.log("Ignoring speech_started during opener/startup");
+        logTime("Ignoring speech_started during opener/startup");
         return;
       }
 
@@ -1651,9 +2764,15 @@ if (responseInProgress) {
   return;
 }
 
-responseInProgress = true;
+if (Date.now() < assistantPlaybackUntil) {
+  logTime("SPEECH STOPPED ignored — assistant still playing");
+  return;
+}
 
-console.log("SPEECH STOPPED → response.create (manual reply turn)");
+responseInProgress = true;
+assistantTurnText = "";
+
+logTime("SPEECH STOPPED → response.create (manual reply turn)");
 
 openAiWs.send(
   JSON.stringify({
@@ -1667,6 +2786,7 @@ openAiWs.send(
    if (event.type === "response.done") {
 
   responseInProgress = false;
+  wordTelemetry.flush();
 
   if (
     elevenBuffer &&
@@ -1674,43 +2794,42 @@ openAiWs.send(
     elevenWs.readyState === WebSocket.OPEN
   ) {
 
-    elevenWs.send(JSON.stringify({
-     text: elevenBuffer,
-flush: true
-    }));
+    const finalSent = sendTextToEleven(elevenWs, elevenBuffer, {
+      flush: true,
+    });
+    if (finalSent) {
+      logTime(
+        "FINAL ELEVEN FLUSH:",
+        finalSent.shaped,
+        `(tone: ${finalSent.tone})`
+      );
+    }
 
-    console.log("FINAL ELEVEN FLUSH:", elevenBuffer);
-
+    assistantTurnText += elevenBuffer;
     elevenBuffer = "";
   }
 
-  if (openerInProgress) {
-    openerInProgress = false;
+  const assistantText =
+    extractAssistantTextFromResponse(event) || assistantTurnText;
 
-    if (callState === CALL_STATE.OPENING) {
-      callState = CALL_STATE.LISTENING;
-
-      console.log("OPENER ACTUALLY FINISHED → LISTENING");
-    }
+  if (assistantText) {
+    fullCallTranscript += `ASSISTANT: ${assistantText}\n`;
   }
 
-  const text = JSON.stringify(event);
+  maybeScheduleFarewellHangup(
+    assistantText,
+    event.response?.status === "cancelled"
+      ? "cancelled farewell"
+      : "response.done farewell"
+  );
 
-  if (shouldEndCall(text)) {
-    scheduleEndCall(text);
-  }
+  assistantTurnText = "";
 
-  if (
-    callState === CALL_STATE.RESPONDING ||
-    callState === CALL_STATE.INTERRUPTING
-  ) {
+  if (callState === CALL_STATE.INTERRUPTING && !hangupTaskScheduled) {
     callState = CALL_STATE.LISTENING;
   }
-
-  responseStartTimestamp = null;
-  lastAssistantItem = null;
 }
-
+    
     if (event.type === "error") {
       
         responseInProgress = false;
@@ -1732,22 +2851,24 @@ flush: true
         streamSid = msg.start.streamSid;
         callSid = msg.start.callSid;
 
+        mediaSessionsByCallSid.set(callSid, teardownMediaSession);
+        endActiveMediaSession = teardownMediaSession;
+        logTime("Media session registered for CallSid:", callSid);
+
         sellerAudioEnabled = false;
 
-setTimeout(() => {
+        setTimeout(() => {
+          sellerAudioEnabled = true;
+          logTime("SELLER AUDIO ENABLED");
+        }, 9500);
 
-  sellerAudioEnabled = true;
-
-  console.log("SELLER AUDIO ENABLED");
-
-}, 8250);
-
-        console.log("Twilio stream started:", {
+        logTime("TWILIO STREAM START (streamSid ready)", {
           streamSid,
           callSid,
         });
 
         flushPendingAssistantAudioToTwilio();
+        playDirectOpenerToEleven("twilio_stream_start");
 
         return;
       }
@@ -1756,7 +2877,7 @@ setTimeout(() => {
 
   latestMediaTimestamp = msg.media.timestamp;
 
-  // Ignore seller audio during opener
+  // Ignore seller audio during opener (8.25s from stream start)
   if (!sellerAudioEnabled) {
     return;
   }
@@ -1775,101 +2896,13 @@ setTimeout(() => {
 }
 
      if (msg.event === "stop") {
-  console.log("Twilio stream stopped:", {
+  logTime("Twilio stream stopped:", {
     streamSid,
     callSid,
   });
 
-  openerInProgress = false;
-
-  if (openerFallbackTimer) {
-    clearTimeout(openerFallbackTimer);
-    openerFallbackTimer = null;
-  }
-
-  const wrongNumberAlreadyHandled =
-    callState === CALL_STATE.WRONG_NUMBER;
-
-  callState = CALL_STATE.ENDED;
-
-
-
-  if (callSid) {
-    const summaryPrompt = `
-Summarize this real estate call in ONE short line.
-
-Interest level MUST be one of:
-- interested
-- not interested
-- follow up
-- no answer
-
-Format exactly like this:
-interest: [one of the four], condition: [if mentioned], timeline: [if mentioned], price: [if mentioned]
-
-Keep it very short. No extra words.
-
-Call:
-${fullCallTranscript}
-`;
-
-    let summary = "";
-
-    try {
-      const res = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          messages: [
-            { role: "system", content: "Only output the formatted call summary line." },
-            { role: "user", content: summaryPrompt },
-          ],
-        }),
-      });
-
-      const data = await res.json();
-      summary = data.choices?.[0]?.message?.content || "";
-    } catch (err) {
-      console.error("Summary error:", err);
-    }
-
-    callNotesBySid[callSid] = {
-      summary,
-      transcript: fullCallTranscript,
-      endedAt: new Date().toISOString(),
-    };
-
-    console.log("CALL SUMMARY:", summary);
-  }
-
-if (wrongNumberAlreadyHandled) {
-  console.log("Skipping final classification because wrong number was already detected.");
-} else if (!sellerUtteranceDetected) {
-updateGHL(
-  "no_answer_voicemail",
-  "No answer or voicemail reached. No meaningful seller response.",
-  currentCallLead.phone
-);
-} else if (!fullTranscript || fullTranscript.length < 10) {
-updateGHL(
-  "follow_up",
-  "Seller answered but hung up before a full conversation.",
-  currentCallLead.phone
-);
-} else {
-  classifyCall(fullTranscript).then((result) => {
-updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
-  });
-}
-
-
-  if (openAiWs.readyState === WebSocket.OPEN) {
-    openAiWs.close();
-  }
+  teardownMediaSession("stream-stop");
+  void finalizeCallAfterMediaEnd("stream-stop");
 
   return;
 }
@@ -1879,18 +2912,9 @@ updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
   });
 
   twilioWs.on("close", () => {
-    console.log("Twilio websocket closed");
-
-    if (openerFallbackTimer) {
-      clearTimeout(openerFallbackTimer);
-      openerFallbackTimer = null;
-    }
-
-    openerInProgress = false;
-
-    if (openAiWs.readyState === WebSocket.OPEN) {
-      openAiWs.close();
-    }
+    logTime("Twilio websocket closed");
+    teardownMediaSession("twilio-ws-close");
+    void finalizeCallAfterMediaEnd("twilio-ws-close");
   });
 
   twilioWs.on("error", (err) => {
@@ -1898,14 +2922,8 @@ updateGHL(result.ai_call_outcome, result.call_summary, currentCallLead.phone);
   });
 
   openAiWs.on("close", () => {
-    console.log("OpenAI websocket closed");
+    logTime("OpenAI websocket closed");
 
-    if (openerFallbackTimer) {
-      clearTimeout(openerFallbackTimer);
-      openerFallbackTimer = null;
-    }
-
-    openerInProgress = false;
   });
 
   openAiWs.on("error", (err) => {
